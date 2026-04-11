@@ -332,11 +332,18 @@ bool Pipeline::build_pipeline() {
 
     // Use a placeholder location; format-location-full signal overrides it
     std::string location = cfg_.output.directory + "/seg_%05d." + cfg_.output.container;
+    // async-finalize=FALSE: splitmuxsink writes the moov atom synchronously
+    // before posting EOS on the bus. This guarantees that when our bus watch
+    // sees the EOS message, the file is fully written and safe to encrypt.
+    // With async-finalize=TRUE (the GStreamer 1.20+ default), the moov atom
+    // is written in a separate internal pipeline after EOS is posted, creating
+    // a window where we would encrypt an incomplete file.
     g_object_set(el_.mux_sink,
                  "location",        location.c_str(),
                  "muxer-factory",   muxer_factory,
                  "max-size-time",   max_time,
                  "max-size-bytes",  max_bytes,
+                 "async-finalize",  FALSE,
                  nullptr);
 
     // Add all elements to the pipeline bin
@@ -472,6 +479,11 @@ void Pipeline::handle_error(GstMessage* msg) {
     if (is_recoverable && state_.load() == PipelineState::Recording) {
         // Camera disconnect or read failure — attempt reconnect
         schedule_reconnect();
+    } else if (state_.load() == PipelineState::Reconnecting) {
+        // v4l2src often fires multiple errors as it shuts down (e.g. poll
+        // error followed by buffer allocation failure). We're already waiting
+        // for EOS to finalize the segment; just ignore these follow-up errors.
+        health_.info("Ignoring follow-up error while waiting for segment finalization");
     } else {
         // Non-recoverable error (format/caps mismatch, or error outside Recording state); quit
         if (loop_) g_main_loop_quit(loop_);
@@ -488,6 +500,9 @@ void Pipeline::handle_eos() {
         health_.write_status(make_status());
     } else if (cur_state == PipelineState::Stopping) {
         if (loop_) g_main_loop_quit(loop_);
+    } else if (cur_state == PipelineState::Reconnecting) {
+        // EOS from the muxer finalization we triggered in schedule_reconnect().
+        do_reconnect_teardown(true);
     }
 }
 
@@ -497,25 +512,51 @@ void Pipeline::handle_eos() {
 
 void Pipeline::schedule_reconnect() {
     set_state(PipelineState::Reconnecting);
-    eos_received_.store(false); // reset for the new pipeline that will be built
+    reconnect_teardown_done_.store(false);
+    reconnect_attempts_.fetch_add(1);
 
-    // Tear down the broken pipeline elements. Remove the bus watch first so
-    // any pending messages from the dying pipeline don't fire callbacks while
-    // we're in the middle of destruction.
+    // GStreamer's BaseSrc automatically pushes an EOS event downstream when
+    // v4l2src's fill() returns GST_FLOW_ERROR (see gst_base_src_loop in
+    // basesrc.c: any flow return ≤ GST_FLOW_EOS triggers a pad EOS push).
+    // That EOS is already in flight through the pipeline toward splitmuxsink.
+    //
+    // With async-finalize=FALSE (set in build_pipeline), splitmuxsink writes
+    // the moov atom synchronously before posting GST_MESSAGE_EOS on the bus.
+    // So we just keep the bus watch alive and wait: handle_eos() will call
+    // do_reconnect_teardown(true) once the file is fully written.
+    //
+    // A 3 s fallback timer covers the case where EOS never arrives (e.g. the
+    // streaming thread was killed before pushing EOS, or the muxer hangs).
+    health_.info("Waiting for muxer to finalize segment on disconnect");
+    g_timeout_add_seconds(3, reconnect_eos_timeout_cb, this);
+    health_.write_status(make_status());
+    // Bus watch stays active; handle_eos() will call do_reconnect_teardown().
+}
+
+// Called by handle_eos() (good path) or reconnect_eos_timeout_cb() (fallback).
+// Guards against double execution with reconnect_teardown_done_.
+void Pipeline::do_reconnect_teardown(bool segment_finalized) {
+    bool expected = false;
+    if (!reconnect_teardown_done_.compare_exchange_strong(expected, true))
+        return; // already ran (timeout fired after handle_eos, or vice-versa)
+
+    if (segment_finalized)
+        health_.info("Segment finalized cleanly on disconnect");
+    else
+        health_.warn("EOS did not propagate on disconnect; segment may be incomplete");
+
     if (bus_watch_id_) {
         g_source_remove(bus_watch_id_);
         bus_watch_id_ = 0;
     }
     if (el_.pipeline) {
         gst_element_set_state(el_.pipeline, GST_STATE_NULL);
+        gst_element_get_state(el_.pipeline, nullptr, nullptr, GST_SECOND);
         gst_object_unref(el_.pipeline);
         el_ = {};
     }
 
-    // The segment active at disconnect time is incomplete — mp4mux never got to
-    // write its moov atom because the kernel invalidated the V4L2 fd before EOS
-    // could propagate. Encrypt it anyway so delete_plaintext removes the corrupt
-    // plaintext; if encryption is disabled, just delete it.
+    // Handle the segment that was open at disconnect time.
     const uint32_t partial_idx = fragment_index_.load();
     if (partial_idx > 0) {
         const std::string partial_path = utils::segment_filename(cfg_, session_id_, partial_idx - 1);
@@ -523,21 +564,29 @@ void Pipeline::schedule_reconnect() {
         if (fs::exists(partial_path, ec)) {
             if (cfg_.encryption.enabled) {
                 enqueue_encryption(partial_path);
-            } else {
+            } else if (!segment_finalized) {
                 fs::remove(partial_path, ec);
                 if (ec) health_.warn("Failed to remove incomplete segment: " + partial_path + ": " + ec.message());
                 else    health_.info("Removed incomplete segment: " + partial_path);
             }
+            // else: encryption disabled, file is a valid MP4 — keep it.
         }
     }
 
-    reconnect_attempts_.fetch_add(1);
-    health_.info("Scheduling reconnect in " + std::to_string(reconnect_backoff_sec_) + "s");
-    health_.write_status(make_status());
-
-    g_timeout_add_seconds(reconnect_backoff_sec_, try_reconnect_cb, this);
-
+    const uint32_t backoff = reconnect_backoff_sec_;
     reconnect_backoff_sec_ = std::min(reconnect_backoff_sec_ * 2u, 60u);
+    health_.info("Scheduling reconnect in " + std::to_string(backoff) + "s");
+    health_.write_status(make_status());
+    g_timeout_add_seconds(backoff, try_reconnect_cb, this);
+}
+
+gboolean Pipeline::reconnect_eos_timeout_cb(gpointer user_data) {
+    auto* self = static_cast<Pipeline*>(user_data);
+    if (self->state_.load() != PipelineState::Reconnecting) return FALSE;
+    if (self->eos_received_.load()) return FALSE; // handle_eos already ran teardown
+    self->health_.warn("EOS timeout on disconnect after 3 s");
+    self->do_reconnect_teardown(false);
+    return FALSE;
 }
 
 gboolean Pipeline::try_reconnect_cb(gpointer user_data) {
@@ -581,6 +630,7 @@ gboolean Pipeline::try_reconnect_cb(gpointer user_data) {
         self->schedule_retry();
     } else {
         self->reconnect_backoff_sec_ = 1; // reset backoff on success
+        self->eos_received_.store(false);  // reset for the new pipeline
         self->set_state(PipelineState::Recording);
         self->health_.write_status(self->make_status());
     }

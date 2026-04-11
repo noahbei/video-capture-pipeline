@@ -94,7 +94,8 @@ private:
     // ---- State machine ----------------------------------------------------
     std::atomic<PipelineState> state_{PipelineState::Stopped};
     std::atomic<uint32_t>      reconnect_attempts_{0};
-    std::atomic<bool>          eos_received_{false};  // true once GST_MESSAGE_EOS arrives on bus
+    std::atomic<bool>          eos_received_{false};       // true once GST_MESSAGE_EOS arrives on bus
+    std::atomic<bool>          reconnect_teardown_done_{false}; // guards do_reconnect_teardown against double-call
     uint32_t                   reconnect_backoff_sec_ = 1;
     std::time_t                start_time_            = 0;
 
@@ -126,8 +127,10 @@ private:
     void handle_error(GstMessage* msg);
     void handle_eos();
     void schedule_reconnect();
+    void do_reconnect_teardown(bool segment_finalized);
     void schedule_retry();  // re-queue a reconnect timer without resetting state
     static gboolean try_reconnect_cb(gpointer user_data);
+    static gboolean reconnect_eos_timeout_cb(gpointer user_data);
     static gboolean disk_poll_cb(gpointer user_data);
 
     // GStreamer signal/callback statics
