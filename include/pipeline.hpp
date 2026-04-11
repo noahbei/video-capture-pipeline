@@ -88,6 +88,7 @@ private:
     // ---- State machine ----------------------------------------------------
     std::atomic<PipelineState> state_{PipelineState::Stopped};
     std::atomic<uint32_t>      reconnect_attempts_{0};
+    std::atomic<bool>          eos_received_{false};  // true once GST_MESSAGE_EOS arrives on bus
     uint32_t                   reconnect_backoff_sec_ = 1;
     std::time_t                start_time_            = 0;
 

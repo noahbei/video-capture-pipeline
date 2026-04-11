@@ -108,15 +108,23 @@ void Pipeline::stop() {
     health_.info("Pipeline stopping");
 
     if (el_.pipeline) {
-        // Send EOS to flush and finalize the current segment
+        // Send EOS; handle_eos() will call g_main_loop_quit() once EOS propagates
+        // through splitmuxsink (which writes the MP4 moov atom before posting EOS).
         gst_element_send_event(el_.pipeline, gst_event_new_eos());
-        // Wait briefly for EOS to propagate (the bus handler calls g_main_loop_quit)
-        // If run_loop() is active it will quit; if called externally, give it 5 seconds.
-        // We don't block here — destroy_pipeline()'s set_to_NULL is sufficient for cleanup.
-    }
-
-    if (loop_ && g_main_loop_is_running(loop_)) {
-        g_main_loop_quit(loop_);
+        // Safety: force quit if EOS doesn't arrive within 5 s.
+        g_timeout_add_seconds(5, [](gpointer udata) -> gboolean {
+            auto* self = static_cast<Pipeline*>(udata);
+            if (self->state_.load() == PipelineState::Stopping &&
+                self->loop_ && g_main_loop_is_running(self->loop_)) {
+                self->health_.warn("EOS timeout, forcing loop quit");
+                g_main_loop_quit(self->loop_);
+            }
+            return FALSE;
+        }, this);
+    } else {
+        // No active pipeline (e.g., Reconnecting state); quit immediately.
+        if (loop_ && g_main_loop_is_running(loop_))
+            g_main_loop_quit(loop_);
     }
 }
 
@@ -124,13 +132,38 @@ void Pipeline::run_loop() {
     if (!loop_) return;
     g_main_loop_run(loop_); // blocks
 
-    // After the loop exits, finalize
-
-    // NULL the pipeline (flushes and closes any open file) before touching the
-    // segment on disk. el_.pipeline may already be null if we stopped while in
-    // the Reconnecting state (pipeline was torn down but not yet rebuilt).
+    // After the loop exits, finalize the current segment before touching it on disk.
+    //
+    // The loop can exit in three ways:
+    //   1. handle_eos() with state==Stopping  — EOS already propagated; muxer is finalized.
+    //   2. request_quit() from signal handler — no EOS was ever sent; muxer is NOT finalized.
+    //   3. handle_error() non-recoverable    — no EOS; pipeline may be in error state.
+    //
+    // For cases 2 and 3 we send EOS now and wait for splitmuxsink to write its trailer
+    // (the MP4 moov atom) before we NULL the pipeline.  Without this, the recorded
+    // file has no moov atom and cannot be played back.
+    //
+    // el_.pipeline is null when we were in the Reconnecting state (pipeline torn down
+    // but not yet rebuilt) — nothing to finalize in that case.
     if (el_.pipeline) {
+        if (!eos_received_.load()) {
+            // EOS was not received through the normal bus path; send it now.
+            gst_element_send_event(el_.pipeline, gst_event_new_eos());
+            // Poll the bus directly — the GLib main loop is no longer running.
+            GstBus* bus = gst_element_get_bus(el_.pipeline);
+            GstMessage* msg = gst_bus_timed_pop_filtered(
+                bus, 5 * GST_SECOND,
+                static_cast<GstMessageType>(GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+            if (msg)
+                gst_message_unref(msg);
+            else
+                health_.warn("Shutdown: EOS did not propagate within 5 s; segment may be incomplete");
+            gst_object_unref(bus);
+        }
+        // Set to NULL and wait for the state change to complete so the file is
+        // fully written to disk before the encryption worker opens it.
         gst_element_set_state(el_.pipeline, GST_STATE_NULL);
+        gst_element_get_state(el_.pipeline, nullptr, nullptr, 5 * GST_SECOND);
     }
 
     // Encrypt the last open segment. fragment_index_ always reflects the
@@ -417,6 +450,7 @@ void Pipeline::handle_error(GstMessage* msg) {
 
 void Pipeline::handle_eos() {
     health_.info("EOS received");
+    eos_received_.store(true);
     const auto cur_state = state_.load();
     if (cur_state == PipelineState::PausedDiskFull) {
         // EOS was triggered by disk-full handler; now actually pause
@@ -433,6 +467,7 @@ void Pipeline::handle_eos() {
 
 void Pipeline::schedule_reconnect() {
     set_state(PipelineState::Reconnecting);
+    eos_received_.store(false); // reset for the new pipeline that will be built
 
     // Tear down the broken pipeline elements. Remove the bus watch first so
     // any pending messages from the dying pipeline don't fire callbacks while
@@ -522,6 +557,7 @@ gboolean Pipeline::disk_poll_cb(gpointer user_data) {
             self->health_.info("Disk space restored, resuming recording");
             GstStateChangeReturn ret = gst_element_set_state(self->el_.pipeline, GST_STATE_PLAYING);
             if (ret != GST_STATE_CHANGE_FAILURE) {
+                self->eos_received_.store(false); // pipeline is live again
                 self->set_state(PipelineState::Recording);
                 self->health_.write_status(self->make_status());
             }
