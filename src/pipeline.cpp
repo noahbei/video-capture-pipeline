@@ -490,6 +490,25 @@ void Pipeline::schedule_reconnect() {
         el_ = {};
     }
 
+    // The segment active at disconnect time is incomplete — mp4mux never got to
+    // write its moov atom because the kernel invalidated the V4L2 fd before EOS
+    // could propagate. Encrypt it anyway so delete_plaintext removes the corrupt
+    // plaintext; if encryption is disabled, just delete it.
+    const uint32_t partial_idx = fragment_index_.load();
+    if (partial_idx > 0) {
+        const std::string partial_path = utils::segment_filename(cfg_, partial_idx - 1);
+        std::error_code ec;
+        if (fs::exists(partial_path, ec)) {
+            if (cfg_.encryption.enabled) {
+                enqueue_encryption(partial_path);
+            } else {
+                fs::remove(partial_path, ec);
+                if (ec) health_.warn("Failed to remove incomplete segment: " + partial_path + ": " + ec.message());
+                else    health_.info("Removed incomplete segment: " + partial_path);
+            }
+        }
+    }
+
     reconnect_attempts_.fetch_add(1);
     health_.info("Scheduling reconnect in " + std::to_string(reconnect_backoff_sec_) + "s");
     health_.write_status(make_status());
@@ -606,7 +625,7 @@ gchar* Pipeline::on_format_location_full(GstElement* /*splitmux*/,
     // Encrypt the previous (now-closed) segment. Use fragment_id (not actual_idx)
     // for the > 0 guard: when fragment_id==0 there is no prior segment from this
     // splitmuxsink instance; the partial segment from a prior disconnect (if any)
-    // is handled separately in run_loop().
+    // was already handled in schedule_reconnect().
     if (fragment_id > 0 && self->cfg_.encryption.enabled) {
         const std::string prev_path = utils::segment_filename(self->cfg_, actual_idx - 1);
         if (fs::exists(prev_path)) {

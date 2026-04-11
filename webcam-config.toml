@@ -45,14 +45,14 @@ filename_pattern = "seg_%05d"
 
 [rotation]
 # Rotation trigger: "duration" (time-based) or "size" (file-size-based)
-mode            = "size"
+mode            = "duration"
 
 # Maximum segment size in bytes (active when mode = "size")
 # Example: 524288000 = 500 MB
 max_size_bytes  = 4000000
 
 # Maximum segment duration in seconds (active when mode = "duration")
-max_duration_sec = 30
+max_duration_sec = 10
 
 
 [encryption]
