@@ -19,18 +19,24 @@ inline std::string utc_timestamp_str() {
 }
 
 // Returns the full path for segment index, e.g. "/var/capture/seg_00042.mp4"
-inline std::string segment_filename(const Config& cfg, uint32_t index) {
+// If session_id is non-empty the filename is prefixed: "20260412T142205_seg_00042.mp4"
+inline std::string segment_filename(const Config& cfg,
+                                    const std::string& session_id,
+                                    uint32_t index) {
     const char* ext = (cfg.output.container == "mkv") ? ".mkv" : ".mp4";
     char namebuf[256];
     // filename_pattern is a printf format string with one %...d conversion
     std::snprintf(namebuf, sizeof(namebuf),
                   cfg.output.filename_pattern.c_str(), index);
-    return cfg.output.directory + "/" + namebuf + ext;
+    const std::string prefix = session_id.empty() ? "" : session_id + "_";
+    return cfg.output.directory + "/" + prefix + namebuf + ext;
 }
 
 // Returns the encrypted counterpart path: same as segment_filename + ".vcpenc"
-inline std::string encrypted_filename(const Config& cfg, uint32_t index) {
-    return segment_filename(cfg, index) + ".vcpenc";
+inline std::string encrypted_filename(const Config& cfg,
+                                      const std::string& session_id,
+                                      uint32_t index) {
+    return segment_filename(cfg, session_id, index) + ".vcpenc";
 }
 
 } // namespace vcp::utils

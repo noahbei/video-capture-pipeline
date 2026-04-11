@@ -39,7 +39,9 @@ directory       = "/var/capture"
 container       = "mp4"
 
 # printf-style pattern for segment filenames (%d = segment index). Extension is appended.
-# Example: "seg_%05d" → seg_00000.mp4, seg_00001.mp4, ...
+# A session ID (YYYYMMDDTHHmmss) is automatically prepended at startup to prevent
+# files from different runs colliding.
+# Example: "seg_%05d" → 20260412T142205_seg_00000.mp4, 20260412T142205_seg_00001.mp4, ...
 filename_pattern = "seg_%05d"
 
 

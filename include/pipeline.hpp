@@ -86,6 +86,7 @@ private:
 
     // ---- Configuration + dependencies -------------------------------------
     const Config&   cfg_;
+    std::string     session_id_;   // YYYYMMDDTHHmmss, set at construction
     std::array<uint8_t, 32> key_;
     Health&         health_;
     DiskMonitor     disk_monitor_;

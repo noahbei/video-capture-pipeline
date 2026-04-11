@@ -57,6 +57,15 @@ Pipeline::Pipeline(const Config& cfg, const uint8_t key[32], Health& health)
     , disk_monitor_(cfg.output.directory, cfg.disk.min_free_bytes)
 {
     std::memcpy(key_.data(), key, 32);
+
+    // Generate a session ID for this process lifetime so that segments from
+    // different runs never share filenames (e.g. "20260412T142205").
+    std::time_t now = std::time(nullptr);
+    struct tm tm_buf{};
+    gmtime_r(&now, &tm_buf);
+    char sid[16];
+    std::strftime(sid, sizeof(sid), "%Y%m%dT%H%M%S", &tm_buf);
+    session_id_ = sid;
 }
 
 Pipeline::~Pipeline() {
@@ -185,7 +194,7 @@ void Pipeline::run_loop() {
     if (cfg_.encryption.enabled) {
         const uint32_t last_idx = fragment_index_.load();
         if (last_idx > 0) {
-            const std::string path = utils::segment_filename(cfg_, last_idx - 1);
+            const std::string path = utils::segment_filename(cfg_, session_id_, last_idx - 1);
             if (fs::exists(path)) {
                 enqueue_encryption(path);
             }
@@ -509,7 +518,7 @@ void Pipeline::schedule_reconnect() {
     // plaintext; if encryption is disabled, just delete it.
     const uint32_t partial_idx = fragment_index_.load();
     if (partial_idx > 0) {
-        const std::string partial_path = utils::segment_filename(cfg_, partial_idx - 1);
+        const std::string partial_path = utils::segment_filename(cfg_, session_id_, partial_idx - 1);
         std::error_code ec;
         if (fs::exists(partial_path, ec)) {
             if (cfg_.encryption.enabled) {
@@ -640,23 +649,23 @@ gchar* Pipeline::on_format_location_full(GstElement* /*splitmux*/,
     // splitmuxsink instance; the partial segment from a prior disconnect (if any)
     // was already handled in schedule_reconnect().
     if (fragment_id > 0 && self->cfg_.encryption.enabled) {
-        const std::string prev_path = utils::segment_filename(self->cfg_, actual_idx - 1);
+        const std::string prev_path = utils::segment_filename(self->cfg_, self->session_id_, actual_idx - 1);
         if (fs::exists(prev_path)) {
             self->enqueue_encryption(prev_path);
         }
     }
 
     // Track segment stats
-    const std::string new_path = utils::segment_filename(self->cfg_, actual_idx);
+    const std::string new_path = utils::segment_filename(self->cfg_, self->session_id_, actual_idx);
     {
         std::lock_guard<std::mutex> lk(self->segment_mutex_);
         if (fragment_id > 0) {
             self->segments_written_.fetch_add(1);
             // Approximate bytes: get file size of just-closed segment
             std::error_code ec;
-            const auto sz = fs::file_size(utils::segment_filename(self->cfg_, actual_idx - 1), ec);
+            const auto sz = fs::file_size(utils::segment_filename(self->cfg_, self->session_id_, actual_idx - 1), ec);
             if (!ec) self->bytes_written_.fetch_add(sz);
-            self->last_segment_      = utils::segment_filename(self->cfg_, actual_idx - 1);
+            self->last_segment_      = utils::segment_filename(self->cfg_, self->session_id_, actual_idx - 1);
             self->last_segment_time_ = utils::utc_timestamp_str();
         }
     }
