@@ -109,3 +109,9 @@ The dominant latency source in practice is the muxer flush at segment boundaries
 **ML object detection** — run a detection model (YOLO or TFLite) on each frame in a background thread and log results to the health output. It can't be allowed to slow down the recording if it falls behind.
 
 **Metrics export** — most of the useful numbers (segments written, disk space, queue depth, reconnect count) are already tracked internally. The work is just exposing them over HTTP or another easy way for people to access them.
+
+---
+
+## AI Tooling
+
+Claude Code was used throughout this project for planning the overall architecture, generating code across modules, and debugging. The `CLAUDE.md` file in the repository captures the project context that was maintained across sessions.
