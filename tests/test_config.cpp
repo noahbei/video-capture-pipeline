@@ -29,7 +29,7 @@ static void test_full_config() {
 
     const std::string toml = R"toml(
 [camera]
-device        = "/dev/video1"
+device        = "/dev/video99"
 width         = 1920
 height        = 1080
 framerate     = 25
@@ -71,7 +71,7 @@ status_file = "/tmp/vcpstatus.json"
     const fs::path p = write_toml(toml);
     const vcp::Config cfg = vcp::load_config(p.string());
 
-    assert(cfg.camera.device        == "/dev/video1");
+    assert(cfg.camera.device        == "/dev/video99");
     assert(cfg.camera.width         == 1920);
     assert(cfg.camera.height        == 1080);
     assert(cfg.camera.framerate     == 25);
@@ -111,7 +111,7 @@ static void test_minimal_config() {
 
     const std::string toml = R"toml(
 [camera]
-device = "/dev/video0"
+device = "/dev/video99"
 
 [output]
 directory = "/var/capture"
@@ -149,7 +149,7 @@ static void test_bad_container() {
 
     const std::string toml = R"toml(
 [camera]
-device = "/dev/video0"
+device = "/dev/video99"
 
 [output]
 directory = "/var/capture"
@@ -186,7 +186,7 @@ static void test_bad_rotation_mode() {
 
     const std::string toml = R"toml(
 [camera]
-device = "/dev/video0"
+device = "/dev/video99"
 
 [output]
 directory = "/var/capture"
@@ -219,7 +219,7 @@ static void test_encryption_no_key() {
 
     const std::string toml = R"toml(
 [camera]
-device = "/dev/video0"
+device = "/dev/video99"
 
 [output]
 directory = "/var/capture"
@@ -255,7 +255,7 @@ static void test_unknown_keys_ignored() {
 
     const std::string toml = R"toml(
 [camera]
-device = "/dev/video0"
+device = "/dev/video99"
 future_option = "something"
 
 [output]
@@ -276,7 +276,7 @@ foo = "bar"
     const fs::path p = write_toml(toml);
     // Should not throw
     vcp::Config cfg = vcp::load_config(p.string());
-    assert(cfg.camera.device == "/dev/video0");
+    assert(cfg.camera.device == "/dev/video99");
     std::printf("PASS\n");
 }
 

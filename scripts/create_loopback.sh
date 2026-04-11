@@ -23,8 +23,7 @@ if ! lsmod | grep -q v4l2loopback; then
     modprobe v4l2loopback \
         devices=1 \
         video_nr="${DEVICE_NR}" \
-        card_label="${CARD_LABEL}" \
-        exclusive_caps=1
+        card_label="${CARD_LABEL}"
     sleep 1
 fi
 

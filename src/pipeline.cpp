@@ -211,8 +211,11 @@ bool Pipeline::build_pipeline() {
     }
 
     // Create all elements
+    const char* src_factory = cfg_.camera.src_element.empty()
+                              ? "v4l2src"
+                              : cfg_.camera.src_element.c_str();
     el_.pipeline = gst_pipeline_new("vcpcapture");
-    el_.src      = gst_element_factory_make("v4l2src",      "src");
+    el_.src      = gst_element_factory_make(src_factory,    "src");
     el_.src_caps = gst_element_factory_make("capsfilter",   "src_caps");
     el_.convert  = gst_element_factory_make("videoconvert", "convert");
     el_.scale    = gst_element_factory_make("videoscale",   "scale");
@@ -238,11 +241,16 @@ bool Pipeline::build_pipeline() {
 
     // --- Set properties ---
 
-    // v4l2src
-    g_object_set(el_.src,
-                 "device",       cfg_.camera.device.c_str(),
-                 "do-timestamp", TRUE,
-                 nullptr);
+    // v4l2src (or test source)
+    if (cfg_.camera.src_element.empty() || cfg_.camera.src_element == "v4l2src") {
+        g_object_set(el_.src,
+                     "device",       cfg_.camera.device.c_str(),
+                     "do-timestamp", TRUE,
+                     nullptr);
+    } else {
+        // Test source (e.g. videotestsrc): make it behave like a live source.
+        g_object_set(el_.src, "is-live", TRUE, nullptr);
+    }
 
     // capsfilter: source caps lock V4L2 format
     GstCaps* src_caps;
@@ -667,6 +675,21 @@ void Pipeline::encryption_worker() {
             health_.error(std::string("Encryption failed for ") + job + ": " + e.what());
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test hook
+// ---------------------------------------------------------------------------
+
+void Pipeline::post_error_for_test() {
+    if (!el_.pipeline || !el_.src) return;
+    GError* err = g_error_new(GST_RESOURCE_ERROR,
+                              GST_RESOURCE_ERROR_READ,
+                              "simulated camera disconnect (test)");
+    gst_element_post_message(
+        el_.src,
+        gst_message_new_error(GST_OBJECT(el_.src), err, "injected by post_error_for_test"));
+    g_error_free(err);
 }
 
 } // namespace vcp

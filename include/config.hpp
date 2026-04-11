@@ -11,6 +11,9 @@ struct CameraConfig {
     int         height        = 720;
     int         framerate     = 30;
     std::string pixel_format  = "YUY2";
+    // Override the GStreamer source element factory name. Empty → "v4l2src".
+    // Set to "videotestsrc" in unit/integration tests that must run without hardware.
+    std::string src_element;
 };
 
 struct EncoderConfig {

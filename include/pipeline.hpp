@@ -54,6 +54,11 @@ public:
     // Request the loop to quit (async-signal-safe via g_main_loop_quit).
     void request_quit();
 
+    // Post a fake GST_RESOURCE_ERROR on the pipeline bus to exercise the
+    // disconnect/reconnect state machine without real hardware.
+    // Only call this from tests while the pipeline is in Recording state.
+    void post_error_for_test();
+
     PipelineState state() const { return state_.load(); }
 
     // Access the current health status snapshot (called by main loop / disk timer).

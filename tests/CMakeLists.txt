@@ -20,6 +20,6 @@ set_tests_properties(test_disk_monitor PROPERTIES LABELS "integration")
 add_vcp_test(test_pipeline_backpressure)
 set_tests_properties(test_pipeline_backpressure PROPERTIES LABELS "integration")
 
-add_vcp_test(test_pipeline_disconnect)
-set_tests_properties(test_pipeline_disconnect PROPERTIES
-    LABELS "integration;requires_v4l2loopback")
+add_vcp_test(test_pipeline_reconnect)
+set_tests_properties(test_pipeline_reconnect PROPERTIES LABELS "integration")
+
