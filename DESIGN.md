@@ -95,3 +95,17 @@ The `queue` element between the encoder and the muxer is configured with `leaky=
 | `delete_plaintext = true` by default | No plaintext copy remains on disk after encryption | If the process is killed mid-encryption, both files must be inspected on recovery |
 
 The dominant latency source in practice is the muxer flush at segment boundaries, not the encoder or encryption. Shorter `max_duration_sec` reduces the worst-case latency to access the latest recording but increases rotation overhead and the number of files to manage.
+
+---
+
+## Stretch Goals — Not Implemented
+
+**systemd integration** — write a `.service` file that tells systemd to start `vcpcapture` on boot and restart it if it crashes. The main risk is that systemd and the built-in reconnect logic both try to recover from failures independently, so their retry timers need to be tuned to not conflict.
+
+**Network streaming** — split the video stream so one copy goes to disk like we are doing now and another is sent over the network (RTSP or raw TCP). The tricky part is making sure a slow or disconnected viewer can't slow down the recording — the two paths need to be independent. The live stream would also be unencrypted, unlike the stored segments.
+
+**Yocto packaging** — write a build recipe so the app can be compiled and included in a custom Linux image. Most dependencies are already available in standard Yocto layers. The main concern is keeping the encryption key out of the base image — it should live on a separate, read-only partition.
+
+**ML object detection** — run a detection model (YOLO or TFLite) on each frame in a background thread and log results to the health output. It can't be allowed to slow down the recording if it falls behind.
+
+**Metrics export** — most of the useful numbers (segments written, disk space, queue depth, reconnect count) are already tracked internally. The work is just exposing them over HTTP or another easy way for people to access them.
