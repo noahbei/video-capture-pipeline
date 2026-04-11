@@ -65,6 +65,7 @@ private:
         GstElement* pipeline  = nullptr;
         GstElement* src       = nullptr;
         GstElement* src_caps  = nullptr;
+        GstElement* jpeg_dec  = nullptr;  // non-null only when pixel_format == "MJPG"
         GstElement* convert   = nullptr;
         GstElement* scale     = nullptr;
         GstElement* enc_caps  = nullptr;

@@ -181,10 +181,15 @@ bool Pipeline::build_pipeline() {
     el_.parser   = gst_element_factory_make("h264parse",    "parser");
     el_.mux_sink = gst_element_factory_make("splitmuxsink", "muxsink");
 
+    const bool is_mjpg = (cfg_.camera.pixel_format == "MJPG");
+
+    if (is_mjpg)
+        el_.jpeg_dec = gst_element_factory_make("jpegdec", "jpeg_dec");
+
     // Validate all elements were created
     if (!el_.pipeline || !el_.src || !el_.src_caps || !el_.convert ||
         !el_.scale || !el_.enc_caps || !el_.queue || !el_.encoder ||
-        !el_.parser || !el_.mux_sink) {
+        !el_.parser || !el_.mux_sink || (is_mjpg && !el_.jpeg_dec)) {
         health_.error("Failed to create one or more GStreamer elements. "
                       "Check that gst-plugins-ugly (x264enc) is installed.");
         return false;
@@ -199,13 +204,24 @@ bool Pipeline::build_pipeline() {
                  nullptr);
 
     // capsfilter: source caps lock V4L2 format
-    GstCaps* src_caps = gst_caps_new_simple(
-        "video/x-raw",
-        "format",    G_TYPE_STRING,       cfg_.camera.pixel_format.c_str(),
-        "width",     G_TYPE_INT,          cfg_.camera.width,
-        "height",    G_TYPE_INT,          cfg_.camera.height,
-        "framerate", GST_TYPE_FRACTION,   cfg_.camera.framerate, 1,
-        nullptr);
+    GstCaps* src_caps;
+    if (is_mjpg) {
+        // MJPG is compressed — V4L2 delivers it as image/jpeg, not video/x-raw
+        src_caps = gst_caps_new_simple(
+            "image/jpeg",
+            "width",     G_TYPE_INT,        cfg_.camera.width,
+            "height",    G_TYPE_INT,        cfg_.camera.height,
+            "framerate", GST_TYPE_FRACTION, cfg_.camera.framerate, 1,
+            nullptr);
+    } else {
+        src_caps = gst_caps_new_simple(
+            "video/x-raw",
+            "format",    G_TYPE_STRING,     cfg_.camera.pixel_format.c_str(),
+            "width",     G_TYPE_INT,        cfg_.camera.width,
+            "height",    G_TYPE_INT,        cfg_.camera.height,
+            "framerate", GST_TYPE_FRACTION, cfg_.camera.framerate, 1,
+            nullptr);
+    }
     g_object_set(el_.src_caps, "caps", src_caps, nullptr);
     gst_caps_unref(src_caps);
 
@@ -256,15 +272,30 @@ bool Pipeline::build_pipeline() {
                  nullptr);
 
     // Add all elements to the pipeline bin
-    gst_bin_add_many(GST_BIN(el_.pipeline),
-                     el_.src, el_.src_caps, el_.convert, el_.scale,
-                     el_.enc_caps, el_.queue, el_.encoder, el_.parser,
-                     el_.mux_sink, nullptr);
+    if (is_mjpg) {
+        gst_bin_add_many(GST_BIN(el_.pipeline),
+                         el_.src, el_.src_caps, el_.jpeg_dec, el_.convert, el_.scale,
+                         el_.enc_caps, el_.queue, el_.encoder, el_.parser,
+                         el_.mux_sink, nullptr);
+    } else {
+        gst_bin_add_many(GST_BIN(el_.pipeline),
+                         el_.src, el_.src_caps, el_.convert, el_.scale,
+                         el_.enc_caps, el_.queue, el_.encoder, el_.parser,
+                         el_.mux_sink, nullptr);
+    }
 
-    // Link: src → src_caps → convert → scale → enc_caps → queue → encoder → parser → mux_sink
-    if (!gst_element_link_many(el_.src, el_.src_caps, el_.convert,
-                               el_.scale, el_.enc_caps, el_.queue,
-                               el_.encoder, el_.parser, el_.mux_sink, nullptr)) {
+    // Link: src → src_caps → [jpegdec →] convert → scale → enc_caps → queue → encoder → parser → mux_sink
+    bool linked;
+    if (is_mjpg) {
+        linked = gst_element_link_many(el_.src, el_.src_caps, el_.jpeg_dec, el_.convert,
+                                       el_.scale, el_.enc_caps, el_.queue,
+                                       el_.encoder, el_.parser, el_.mux_sink, nullptr);
+    } else {
+        linked = gst_element_link_many(el_.src, el_.src_caps, el_.convert,
+                                       el_.scale, el_.enc_caps, el_.queue,
+                                       el_.encoder, el_.parser, el_.mux_sink, nullptr);
+    }
+    if (!linked) {
         health_.error("Failed to link GStreamer pipeline elements");
         return false;
     }
