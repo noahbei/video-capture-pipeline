@@ -1,0 +1,550 @@
+#include "pipeline.hpp"
+#include "utils.hpp"
+
+#include <cassert>
+#include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <stdexcept>
+#include <string>
+
+#include <unistd.h>
+
+#include <gst/gst.h>
+#include <gst/video/video.h>
+
+namespace vcp {
+
+namespace fs = std::filesystem;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const char* pipeline_state_str(PipelineState s) {
+    switch (s) {
+        case PipelineState::Starting:       return "starting";
+        case PipelineState::Recording:      return "recording";
+        case PipelineState::PausedDiskFull: return "paused_disk_full";
+        case PipelineState::Reconnecting:   return "reconnecting";
+        case PipelineState::Stopping:       return "stopping";
+        case PipelineState::Stopped:        return "stopped";
+    }
+    return "unknown";
+}
+
+// Map x264enc speed-preset string → GStreamer enum value.
+// Falls back to 1 (ultrafast) on unknown string.
+static guint x264_speed_preset(const std::string& s) {
+    // GStreamer x264enc speed-preset enum: ultrafast=1 … placebo=9
+    static const std::pair<const char*, guint> table[] = {
+        {"ultrafast", 1}, {"superfast", 2}, {"veryfast", 3},
+        {"faster",    4}, {"fast",      5}, {"medium",   6},
+        {"slow",      7}, {"slower",    8}, {"veryslow", 9}, {"placebo", 10},
+    };
+    for (auto& [name, val] : table)
+        if (s == name) return val;
+    return 1; // default: ultrafast
+}
+
+// ---------------------------------------------------------------------------
+// Constructor / Destructor
+// ---------------------------------------------------------------------------
+
+Pipeline::Pipeline(const Config& cfg, const uint8_t key[32], Health& health)
+    : cfg_(cfg)
+    , health_(health)
+    , disk_monitor_(cfg.output.directory, cfg.disk.min_free_bytes)
+{
+    std::memcpy(key_.data(), key, 32);
+}
+
+Pipeline::~Pipeline() {
+    // Ensure the encryption thread is stopped
+    {
+        std::lock_guard<std::mutex> lk(enc_mutex_);
+        enc_stop_ = true;
+    }
+    enc_cv_.notify_all();
+    if (enc_thread_.joinable()) enc_thread_.join();
+
+    destroy_pipeline();
+}
+
+// ---------------------------------------------------------------------------
+// start / stop / run_loop
+// ---------------------------------------------------------------------------
+
+void Pipeline::start() {
+    set_state(PipelineState::Starting);
+    start_time_ = std::time(nullptr);
+
+    // Start encryption worker thread
+    enc_thread_ = std::thread(&Pipeline::encryption_worker, this);
+
+    if (!build_pipeline()) {
+        throw std::runtime_error("Pipeline::start: failed to build GStreamer pipeline");
+    }
+
+    // Register disk poll timer on the main loop
+    // (loop_ is created in build_pipeline)
+    disk_timer_src_ = g_timeout_add_seconds(
+        static_cast<guint>(cfg_.disk.poll_interval_sec), disk_poll_cb, this);
+
+    GstStateChangeReturn ret = gst_element_set_state(el_.pipeline, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        throw std::runtime_error("Pipeline::start: failed to set pipeline to PLAYING");
+    }
+
+    set_state(PipelineState::Recording);
+    health_.info("Pipeline started, recording to " + cfg_.output.directory);
+
+    HealthStatus st = make_status();
+    health_.write_status(st);
+}
+
+void Pipeline::stop() {
+    set_state(PipelineState::Stopping);
+    health_.info("Pipeline stopping");
+
+    if (el_.pipeline) {
+        // Send EOS to flush and finalize the current segment
+        gst_element_send_event(el_.pipeline, gst_event_new_eos());
+        // Wait briefly for EOS to propagate (the bus handler calls g_main_loop_quit)
+        // If run_loop() is active it will quit; if called externally, give it 5 seconds.
+        // We don't block here — destroy_pipeline()'s set_to_NULL is sufficient for cleanup.
+    }
+
+    if (loop_ && g_main_loop_is_running(loop_)) {
+        g_main_loop_quit(loop_);
+    }
+}
+
+void Pipeline::run_loop() {
+    if (!loop_) return;
+    g_main_loop_run(loop_); // blocks
+
+    // After the loop exits, finalize
+    if (el_.pipeline) {
+        // Encrypt the last open segment
+        const uint32_t last_idx = fragment_index_.load();
+        if (last_idx > 0 && cfg_.encryption.enabled) {
+            // fragment_index_ was already incremented when the last segment opened;
+            // the last CLOSED segment is (last_idx - 1) if a rotation happened,
+            // but if we're stopping mid-segment, the current segment is last_idx - 1
+            // (it was opened but never caused another format-location-full call).
+            const uint32_t current_open = (fragment_index_.load() > 0)
+                                          ? fragment_index_.load() - 1 : 0;
+            const std::string path = utils::segment_filename(cfg_, current_open);
+            if (fs::exists(path)) {
+                enqueue_encryption(path);
+            }
+        }
+        gst_element_set_state(el_.pipeline, GST_STATE_NULL);
+    }
+
+    // Drain encryption queue
+    {
+        std::lock_guard<std::mutex> lk(enc_mutex_);
+        enc_stop_ = true;
+    }
+    enc_cv_.notify_all();
+    if (enc_thread_.joinable()) enc_thread_.join();
+
+    set_state(PipelineState::Stopped);
+    health_.info("Pipeline stopped");
+    health_.write_status(make_status());
+}
+
+void Pipeline::request_quit() {
+    if (loop_ && g_main_loop_is_running(loop_)) {
+        g_main_loop_quit(loop_);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// build_pipeline
+// ---------------------------------------------------------------------------
+
+bool Pipeline::build_pipeline() {
+    loop_ = g_main_loop_new(nullptr, FALSE);
+
+    // Create all elements
+    el_.pipeline = gst_pipeline_new("vcpcapture");
+    el_.src      = gst_element_factory_make("v4l2src",      "src");
+    el_.src_caps = gst_element_factory_make("capsfilter",   "src_caps");
+    el_.convert  = gst_element_factory_make("videoconvert", "convert");
+    el_.scale    = gst_element_factory_make("videoscale",   "scale");
+    el_.enc_caps = gst_element_factory_make("capsfilter",   "enc_caps");
+    el_.queue    = gst_element_factory_make("queue",        "enc_queue");
+    el_.encoder  = gst_element_factory_make("x264enc",      "encoder");
+    el_.parser   = gst_element_factory_make("h264parse",    "parser");
+    el_.mux_sink = gst_element_factory_make("splitmuxsink", "muxsink");
+
+    // Validate all elements were created
+    if (!el_.pipeline || !el_.src || !el_.src_caps || !el_.convert ||
+        !el_.scale || !el_.enc_caps || !el_.queue || !el_.encoder ||
+        !el_.parser || !el_.mux_sink) {
+        health_.error("Failed to create one or more GStreamer elements. "
+                      "Check that gst-plugins-ugly (x264enc) is installed.");
+        return false;
+    }
+
+    // --- Set properties ---
+
+    // v4l2src
+    g_object_set(el_.src,
+                 "device",       cfg_.camera.device.c_str(),
+                 "do-timestamp", TRUE,
+                 nullptr);
+
+    // capsfilter: source caps lock V4L2 format
+    GstCaps* src_caps = gst_caps_new_simple(
+        "video/x-raw",
+        "format",    G_TYPE_STRING,       cfg_.camera.pixel_format.c_str(),
+        "width",     G_TYPE_INT,          cfg_.camera.width,
+        "height",    G_TYPE_INT,          cfg_.camera.height,
+        "framerate", GST_TYPE_FRACTION,   cfg_.camera.framerate, 1,
+        nullptr);
+    g_object_set(el_.src_caps, "caps", src_caps, nullptr);
+    gst_caps_unref(src_caps);
+
+    // capsfilter: encoder input (I420 after videoconvert)
+    GstCaps* enc_caps = gst_caps_new_simple(
+        "video/x-raw",
+        "format", G_TYPE_STRING, "I420",
+        "width",  G_TYPE_INT,    cfg_.camera.width,
+        "height", G_TYPE_INT,    cfg_.camera.height,
+        nullptr);
+    g_object_set(el_.enc_caps, "caps", enc_caps, nullptr);
+    gst_caps_unref(enc_caps);
+
+    // queue: drop-oldest backpressure
+    g_object_set(el_.queue,
+                 "max-size-buffers", static_cast<guint>(cfg_.backpressure.queue_max_buffers),
+                 "leaky",            (guint)2,    // GST_QUEUE_LEAK_DOWNSTREAM = drop oldest
+                 "max-size-bytes",   (guint64)0,
+                 "max-size-time",    (guint64)0,
+                 nullptr);
+
+    // x264enc
+    g_object_set(el_.encoder,
+                 "bitrate",      static_cast<guint>(cfg_.encoder.bitrate_kbps),
+                 "speed-preset", x264_speed_preset(cfg_.encoder.speed_preset),
+                 "tune",         (guint)0x04,   // zerolatency flag
+                 "key-int-max",  static_cast<guint>(cfg_.encoder.key_int_max),
+                 nullptr);
+
+    // h264parse: re-emit SPS/PPS with every IDR so each segment is self-contained
+    g_object_set(el_.parser, "config-interval", -1, nullptr);
+
+    // splitmuxsink
+    const char* muxer_factory = (cfg_.output.container == "mkv") ? "matroskamux" : "mp4mux";
+    guint64 max_time  = (cfg_.rotation.mode == "duration")
+                        ? cfg_.rotation.max_duration_sec * GST_SECOND : 0;
+    guint64 max_bytes = (cfg_.rotation.mode == "size")
+                        ? cfg_.rotation.max_size_bytes : 0;
+
+    // Use a placeholder location; format-location-full signal overrides it
+    std::string location = cfg_.output.directory + "/seg_%05d." + cfg_.output.container;
+    g_object_set(el_.mux_sink,
+                 "location",        location.c_str(),
+                 "muxer-factory",   muxer_factory,
+                 "max-size-time",   max_time,
+                 "max-size-bytes",  max_bytes,
+                 "async-finalize",  TRUE,
+                 nullptr);
+
+    // Add all elements to the pipeline bin
+    gst_bin_add_many(GST_BIN(el_.pipeline),
+                     el_.src, el_.src_caps, el_.convert, el_.scale,
+                     el_.enc_caps, el_.queue, el_.encoder, el_.parser,
+                     el_.mux_sink, nullptr);
+
+    // Link: src → src_caps → convert → scale → enc_caps → queue → encoder → parser → mux_sink
+    if (!gst_element_link_many(el_.src, el_.src_caps, el_.convert,
+                               el_.scale, el_.enc_caps, el_.queue,
+                               el_.encoder, el_.parser, el_.mux_sink, nullptr)) {
+        health_.error("Failed to link GStreamer pipeline elements");
+        return false;
+    }
+
+    // Connect format-location-full signal on splitmuxsink
+    g_signal_connect(el_.mux_sink, "format-location-full",
+                     G_CALLBACK(on_format_location_full), this);
+
+    // Install bus watch on the default GLib main context
+    GstBus* bus = gst_element_get_bus(el_.pipeline);
+    gst_bus_add_watch(bus, [](GstBus*, GstMessage* msg, gpointer udata) -> gboolean {
+        auto* self = static_cast<Pipeline*>(udata);
+        switch (GST_MESSAGE_TYPE(msg)) {
+            case GST_MESSAGE_ERROR:
+                self->handle_error(msg);
+                break;
+            case GST_MESSAGE_EOS:
+                self->handle_eos();
+                break;
+            case GST_MESSAGE_WARNING: {
+                GError* err = nullptr;
+                gchar*  dbg = nullptr;
+                gst_message_parse_warning(msg, &err, &dbg);
+                self->health_.warn(std::string("GStreamer warning: ") + (err ? err->message : "?")
+                                   + (dbg ? std::string(" [") + dbg + "]" : ""));
+                g_clear_error(&err);
+                g_free(dbg);
+                break;
+            }
+            default:
+                break;
+        }
+        return TRUE;
+    }, this);
+    gst_object_unref(bus);
+
+    return true;
+}
+
+void Pipeline::destroy_pipeline() {
+    if (disk_timer_src_) {
+        g_source_remove(disk_timer_src_);
+        disk_timer_src_ = 0;
+    }
+    if (el_.pipeline) {
+        gst_element_set_state(el_.pipeline, GST_STATE_NULL);
+        gst_object_unref(el_.pipeline);
+        el_ = {};
+    }
+    if (loop_) {
+        g_main_loop_unref(loop_);
+        loop_ = nullptr;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State helpers
+// ---------------------------------------------------------------------------
+
+void Pipeline::set_state(PipelineState s) {
+    state_.store(s);
+    health_.info(std::string("State → ") + pipeline_state_str(s));
+}
+
+HealthStatus Pipeline::make_status() const {
+    HealthStatus st;
+    st.state             = pipeline_state_str(state_.load());
+    st.uptime_sec        = static_cast<uint64_t>(std::time(nullptr) - start_time_);
+    st.segments_written  = segments_written_.load();
+    st.bytes_written     = bytes_written_.load();
+    st.disk_free_bytes   = disk_monitor_.free_bytes();
+    st.reconnect_attempts = reconnect_attempts_.load();
+    st.enc_queue_depth   = enc_queue_depth_.load();
+    {
+        std::lock_guard<std::mutex> lk(segment_mutex_);
+        st.last_segment      = last_segment_;
+        st.last_segment_time = last_segment_time_;
+    }
+    return st;
+}
+
+// ---------------------------------------------------------------------------
+// Bus message handlers
+// ---------------------------------------------------------------------------
+
+void Pipeline::handle_error(GstMessage* msg) {
+    GError* err = nullptr;
+    gchar*  dbg = nullptr;
+    gst_message_parse_error(msg, &err, &dbg);
+
+    const std::string err_msg = std::string(err ? err->message : "unknown error")
+                              + (dbg ? std::string(" [") + dbg + "]" : "");
+    health_.error("GStreamer error: " + err_msg);
+
+    bool is_resource_error = err && (err->domain == GST_RESOURCE_ERROR);
+    g_clear_error(&err);
+    g_free(dbg);
+
+    if (is_resource_error && state_.load() == PipelineState::Recording) {
+        // Camera disconnect or read failure — attempt reconnect
+        schedule_reconnect();
+    } else {
+        // Non-recoverable error; quit the main loop
+        if (loop_) g_main_loop_quit(loop_);
+    }
+}
+
+void Pipeline::handle_eos() {
+    health_.info("EOS received");
+    const auto cur_state = state_.load();
+    if (cur_state == PipelineState::PausedDiskFull) {
+        // EOS was triggered by disk-full handler; now actually pause
+        gst_element_set_state(el_.pipeline, GST_STATE_PAUSED);
+        health_.write_status(make_status());
+    } else if (cur_state == PipelineState::Stopping) {
+        if (loop_) g_main_loop_quit(loop_);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Camera reconnect
+// ---------------------------------------------------------------------------
+
+void Pipeline::schedule_reconnect() {
+    set_state(PipelineState::Reconnecting);
+    gst_element_set_state(el_.pipeline, GST_STATE_NULL);
+    reconnect_attempts_.fetch_add(1);
+    health_.info("Scheduling reconnect in " + std::to_string(reconnect_backoff_sec_) + "s");
+    health_.write_status(make_status());
+
+    g_timeout_add_seconds(reconnect_backoff_sec_, try_reconnect_cb, this);
+
+    reconnect_backoff_sec_ = std::min(reconnect_backoff_sec_ * 2u, 60u);
+}
+
+gboolean Pipeline::try_reconnect_cb(gpointer user_data) {
+    auto* self = static_cast<Pipeline*>(user_data);
+    if (self->state_.load() != PipelineState::Reconnecting) return FALSE;
+
+    // Check if the device node is accessible
+    if (access(self->cfg_.camera.device.c_str(), R_OK) != 0) {
+        self->health_.info("Device not available yet, retrying...");
+        self->schedule_retry();
+        return FALSE; // one-shot; new timer added by schedule_retry
+    }
+
+    self->health_.info("Device available, reconnecting pipeline");
+    GstStateChangeReturn ret = gst_element_set_state(self->el_.pipeline, GST_STATE_PLAYING);
+    if (ret == GST_STATE_CHANGE_FAILURE) {
+        self->health_.error("Reconnect failed (set PLAYING returned FAILURE), retrying");
+        self->schedule_retry();
+    } else {
+        self->reconnect_backoff_sec_ = 1; // reset backoff on success
+        self->set_state(PipelineState::Recording);
+        self->health_.write_status(self->make_status());
+    }
+    return FALSE; // one-shot timer
+}
+
+void Pipeline::schedule_retry() {
+    g_timeout_add_seconds(reconnect_backoff_sec_, try_reconnect_cb, this);
+    reconnect_backoff_sec_ = std::min(reconnect_backoff_sec_ * 2u, 60u);
+}
+
+// ---------------------------------------------------------------------------
+// Disk full poll
+// ---------------------------------------------------------------------------
+
+gboolean Pipeline::disk_poll_cb(gpointer user_data) {
+    auto* self = static_cast<Pipeline*>(user_data);
+    const auto cur_state = self->state_.load();
+
+    if (cur_state == PipelineState::PausedDiskFull) {
+        // Check if space has freed up
+        if (!self->disk_monitor_.is_disk_full()) {
+            self->health_.info("Disk space restored, resuming recording");
+            GstStateChangeReturn ret = gst_element_set_state(self->el_.pipeline, GST_STATE_PLAYING);
+            if (ret != GST_STATE_CHANGE_FAILURE) {
+                self->set_state(PipelineState::Recording);
+                self->health_.write_status(self->make_status());
+            }
+        }
+        return TRUE; // keep timer running
+    }
+
+    if (cur_state != PipelineState::Recording) return TRUE;
+
+    if (self->disk_monitor_.is_disk_full()) {
+        self->health_.warn("Disk full (free < " +
+                           std::to_string(self->cfg_.disk.min_free_bytes) +
+                           " bytes), pausing recording");
+        self->set_state(PipelineState::PausedDiskFull);
+        // Send EOS to cleanly close the current segment; handle_eos() will pause the pipeline
+        gst_element_send_event(self->el_.pipeline, gst_event_new_eos());
+        self->health_.write_status(self->make_status());
+    }
+
+    return TRUE; // keep timer running
+}
+
+// ---------------------------------------------------------------------------
+// format-location-full signal — called by splitmuxsink before opening fragment N
+// At this point, fragment N-1 is fully closed.
+// ---------------------------------------------------------------------------
+
+gchar* Pipeline::on_format_location_full(GstElement* /*splitmux*/,
+                                          guint fragment_id,
+                                          GstSample* /*first_sample*/,
+                                          gpointer user_data) {
+    auto* self = static_cast<Pipeline*>(user_data);
+
+    // Encrypt the previous (now-closed) segment
+    if (fragment_id > 0 && self->cfg_.encryption.enabled) {
+        const std::string prev_path = utils::segment_filename(self->cfg_, fragment_id - 1);
+        if (fs::exists(prev_path)) {
+            self->enqueue_encryption(prev_path);
+        }
+    }
+
+    // Track segment stats
+    const std::string new_path = utils::segment_filename(self->cfg_, fragment_id);
+    {
+        std::lock_guard<std::mutex> lk(self->segment_mutex_);
+        if (fragment_id > 0) {
+            self->segments_written_.fetch_add(1);
+            // Approximate bytes: get file size of just-closed segment
+            std::error_code ec;
+            const auto sz = fs::file_size(utils::segment_filename(self->cfg_, fragment_id - 1), ec);
+            if (!ec) self->bytes_written_.fetch_add(sz);
+            self->last_segment_      = utils::segment_filename(self->cfg_, fragment_id - 1);
+            self->last_segment_time_ = utils::utc_timestamp_str();
+        }
+    }
+
+    self->fragment_index_.store(fragment_id + 1);
+    self->health_.debug("Opening segment " + new_path);
+    self->health_.write_status(self->make_status());
+
+    return g_strdup(new_path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Encryption worker
+// ---------------------------------------------------------------------------
+
+void Pipeline::enqueue_encryption(const std::string& plaintext_path) {
+    {
+        std::lock_guard<std::mutex> lk(enc_mutex_);
+        enc_queue_.push(plaintext_path);
+        enc_queue_depth_.store(static_cast<uint32_t>(enc_queue_.size()));
+    }
+    enc_cv_.notify_one();
+}
+
+void Pipeline::encryption_worker() {
+    while (true) {
+        std::string job;
+        {
+            std::unique_lock<std::mutex> lk(enc_mutex_);
+            enc_cv_.wait(lk, [this] { return !enc_queue_.empty() || enc_stop_.load(); });
+            if (enc_stop_.load() && enc_queue_.empty()) break;
+            job = std::move(enc_queue_.front());
+            enc_queue_.pop();
+            enc_queue_depth_.store(static_cast<uint32_t>(enc_queue_.size()));
+        }
+
+        const fs::path src(job);
+        const fs::path dst = fs::path(job).concat(".vcpenc");
+        try {
+            encrypt_file(src, dst, std::span<const uint8_t, 32>(key_.data(), 32));
+            if (cfg_.encryption.delete_plaintext) {
+                std::error_code ec;
+                fs::remove(src, ec);
+                if (ec) health_.warn("Failed to remove plaintext: " + job + ": " + ec.message());
+            }
+            health_.info("Encrypted: " + dst.string());
+        } catch (const std::exception& e) {
+            health_.error(std::string("Encryption failed for ") + job + ": " + e.what());
+        }
+    }
+}
+
+} // namespace vcp
