@@ -359,11 +359,12 @@ void Pipeline::handle_error(GstMessage* msg) {
                               + (dbg ? std::string(" [") + dbg + "]" : "");
     health_.error("GStreamer error: " + err_msg);
 
-    bool is_resource_error = err && (err->domain == GST_RESOURCE_ERROR);
+    bool is_recoverable = err && (err->domain == GST_RESOURCE_ERROR ||
+                                    err->domain == GST_STREAM_ERROR);
     g_clear_error(&err);
     g_free(dbg);
 
-    if (is_resource_error && state_.load() == PipelineState::Recording) {
+    if (is_recoverable && state_.load() == PipelineState::Recording) {
         // Camera disconnect or read failure — attempt reconnect
         schedule_reconnect();
     } else {
