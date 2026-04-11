@@ -12,7 +12,7 @@ height          = 720
 # Frames per second
 framerate       = 30
 
-# V4L2 pixel format: YUY2 (common USB), MJPG (USB compressed), NV12 (CSI/SoC)
+# V4L2 pixel format: YUY2 (common USB), MJPG (USB compressed)
 pixel_format    = "YUY2"
 
 

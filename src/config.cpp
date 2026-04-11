@@ -24,7 +24,6 @@ namespace {
 uint32_t pixel_format_to_v4l2(const std::string& fmt) {
     if (fmt == "MJPG")                    return V4L2_PIX_FMT_MJPEG;
     if (fmt == "YUY2" || fmt == "YUYV")   return V4L2_PIX_FMT_YUYV;
-    if (fmt == "NV12")                    return V4L2_PIX_FMT_NV12;
     return 0; // unrecognised — skip validation
 }
 

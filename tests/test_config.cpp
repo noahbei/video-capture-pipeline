@@ -33,7 +33,7 @@ device        = "/dev/video99"
 width         = 1920
 height        = 1080
 framerate     = 25
-pixel_format  = "NV12"
+pixel_format  = "YUY2"
 
 [encoder]
 bitrate_kbps  = 4000
@@ -75,7 +75,7 @@ status_file = "/tmp/vcpstatus.json"
     assert(cfg.camera.width         == 1920);
     assert(cfg.camera.height        == 1080);
     assert(cfg.camera.framerate     == 25);
-    assert(cfg.camera.pixel_format  == "NV12");
+    assert(cfg.camera.pixel_format  == "YUY2");
 
     assert(cfg.encoder.bitrate_kbps == 4000);
     assert(cfg.encoder.speed_preset == "fast");
