@@ -6,17 +6,23 @@
 - **Embedded / edge deployment.** The target is a Linux SBC or server with a USB camera. CPU budget is limited, so encoding defaults to `ultrafast` preset with `zerolatency` tuning.
 - **Untrusted storage.** The recording volume is assumed to be physically accessible to an adversary. Encryption is on by default, and plaintext segments are deleted immediately after encryption.
 - **Key lives elsewhere.** The AES key is expected on a separate secure partition or HSM. Storing it alongside recordings is explicitly warned against.
-- **Network is not available.** Segments are written locally. Upload or streaming to a remote endpoint is out of scope.
 - **No frame loss is acceptable only up to a budget.** The design prioritises continuous recording over zero frame loss. When the encoder outpaces storage, the oldest buffered frames are dropped rather than blocking and stalling the entire pipeline.
-
+- **Encrypt-after-write is a deliberate simplicity tradeoff.** Segments are written to disk as plaintext first, then encrypted after each rotation completes. If the storage medium is considered untrusted even during the brief write phase, the correct approach would be to encrypt the data stream before it ever reaches the filesystem, such as by writing to a memory-backed staging area or piping through an in-process cipher. That approach was foregone here in favour of a simpler implementation.
+- **The output directory stands in for a dedicated mount.** In a real deployment the recording directory would typically be a separate, dedicated filesystem mounted at a fixed path. For simplicity, a plain directory is used instead.
 ---
 
 ## Capture and Storage Strategy
 
 The GStreamer pipeline is:
 
+**Raw formats (YUY2, etc.):**
 ```
 v4l2src → capsfilter → videoconvert → videoscale → capsfilter → queue → x264enc → h264parse → splitmuxsink
+```
+
+**MJPG pixel format:**
+```
+v4l2src → capsfilter → jpegdec → videoconvert → videoscale → capsfilter → queue → x264enc → h264parse → splitmuxsink
 ```
 
 `splitmuxsink` rotates segments either by wall-clock duration or by file size, controlled by `[rotation]` config. Rotation is triggered by the `format-location-full` signal: just before segment N opens, segment N-1 is fully flushed and closed. The signal callback enqueues the closed path for encryption and returns the new filename for segment N.
@@ -57,11 +63,13 @@ Encryption runs on a dedicated `std::thread` (`encryption_worker`) that drains a
 
 ### Camera Disconnect
 
-The GStreamer bus watch (`handle_error`) detects `GST_RESOURCE_ERROR` or `GST_STREAM_ERROR`. On detection:
+The GStreamer bus watch (`handle_error`) detects errors. Only `GST_RESOURCE_ERROR` is treated as recoverable (device gone, read failure). `GST_STREAM_ERROR` (caps negotiation, unsupported format) is fatal — retrying will not fix a configuration mistake.
 
-1. Pipeline is set to NULL state.
-2. A one-shot GLib timer fires `try_reconnect_cb`, which polls `access(device, R_OK)`.
-3. On failure the backoff doubles (capped at 60 s) via `schedule_retry()`.
+On a recoverable error:
+
+1. `schedule_reconnect()` waits for splitmuxsink to post EOS, which finalizes and flushes the current segment. A 3 s fallback timer handles the case where EOS never arrives.
+2. Once the segment is finalized (or the timeout fires), the pipeline is torn down and the partial segment is enqueued for encryption.
+3. A one-shot GLib timer fires `try_reconnect_cb`, which polls `access(device, R_OK)`. On failure the backoff doubles (capped at 60 s) via `schedule_retry()`.
 4. On success the pipeline is rebuilt and recording resumes from the next segment index.
 
 The state machine reflects this as `Recording → Reconnecting → Recording`.
@@ -90,7 +98,7 @@ The `queue` element between the encoder and the muxer is configured with `leaky=
 | `leaky=2` queue (drop-oldest) | Pipeline never stalls; capture continues through storage hiccups | Oldest frames in the buffer are lost under sustained overload |
 | `zerolatency` encoder tune | Minimises encode latency; frames enter the muxer quickly | Slightly lower compression efficiency vs. default tuning |
 | Async encryption thread | Encryption does not delay segment rotation | Peak memory usage includes one full plaintext segment in-flight |
-| `splitmuxsink async-finalize=true` | Previous muxer can finish writing while the next segment starts | Two muxer instances exist briefly at rotation boundaries |
+| `splitmuxsink async-finalize=FALSE` | Moov atom is written synchronously before EOS is posted, so encryption never opens an incomplete file | Segment rotation blocks until the muxer finishes writing the trailer |
 | Per-segment IV (random) | No IV reuse even if the process crashes and restarts | 12 bytes of overhead per file (negligible) |
 | `delete_plaintext = true` by default | No plaintext copy remains on disk after encryption | If the process is killed mid-encryption, both files must be inspected on recovery |
 
@@ -102,11 +110,11 @@ The dominant latency source in practice is the muxer flush at segment boundaries
 
 **systemd integration** — write a `.service` file that tells systemd to start `vcpcapture` on boot and restart it if it crashes. The main risk is that systemd and the built-in reconnect logic both try to recover from failures independently, so their retry timers need to be tuned to not conflict.
 
-**Network streaming** — split the video stream so one copy goes to disk like we are doing now and another is sent over the network (RTSP or raw TCP). The tricky part is making sure a slow or disconnected viewer can't slow down the recording — the two paths need to be independent. The live stream would also be unencrypted, unlike the stored segments.
+**Network streaming** — split the video stream so one copy goes to disk like we are doing now and another is sent over the network. The tricky part is making sure a slow or disconnected viewer can't slow down the recording, the two paths need to be independent. The live stream would also be unencrypted, unlike the stored segments.
 
-**Yocto packaging** — write a build recipe so the app can be compiled and included in a custom Linux image. Most dependencies are already available in standard Yocto layers. The main concern is keeping the encryption key out of the base image — it should live on a separate, read-only partition.
+**Yocto packaging** — write a build recipe so the app can be compiled and included in a custom Linux image. Most dependencies are already available in standard Yocto layers. The main concern is keeping the encryption key out of the base image, it should live on a separate, read-only partition.
 
-**ML object detection** — run a detection model (YOLO or TFLite) on each frame in a background thread and log results to the health output. It can't be allowed to slow down the recording if it falls behind.
+**ML object detection** — run a detection model on each frame in a background thread and log results to the health output. It can't be allowed to slow down the recording if it falls behind.
 
 **Metrics export** — most of the useful numbers (segments written, disk space, queue depth, reconnect count) are already tracked internally. The work is just exposing them over HTTP or another easy way for people to access them.
 

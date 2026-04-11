@@ -74,13 +74,19 @@ All code lives in the `vcp` namespace. The build produces a static library `vcpc
 
 ### GStreamer pipeline graph
 
+**Raw formats (YUY2, etc.):**
 ```
 v4l2src → capsfilter → videoconvert → videoscale → capsfilter → queue → x264enc → h264parse → splitmuxsink
 ```
 
+**MJPG pixel format** (adds a JPEG decoder between capsfilter and videoconvert):
+```
+v4l2src → capsfilter → jpegdec → videoconvert → videoscale → capsfilter → queue → x264enc → h264parse → splitmuxsink
+```
+
 - `queue` is configured with `leaky=2` (downstream = drop-oldest) and `max-size-buffers` from config. This is the entire backpressure implementation.
 - `h264parse config-interval=-1` re-emits SPS/PPS with every IDR, making each segment independently decodable.
-- `splitmuxsink async-finalize=true` lets the previous muxer finish while the next segment starts.
+- `splitmuxsink async-finalize=FALSE` — the muxer writes the moov atom synchronously before posting EOS. This ensures the file is fully written before the encryption worker opens it.
 - The pipeline is built programmatically with `gst_element_factory_make` (not `gst_parse_launch`) so the muxer (`mp4mux` vs `matroskamux`) can be selected at runtime from config.
 
 ### Rotation and encryption flow
@@ -99,7 +105,7 @@ any → Stopping → Stopped
 
 State transitions happen on the GLib main loop thread (bus watch callback and GLib timer callbacks). `state_` is an `std::atomic` so it can be read safely from `test_pipeline_disconnect`.
 
-- **Camera disconnect**: `handle_error()` detects `GST_RESOURCE_ERROR` or `GST_STREAM_ERROR`, calls `schedule_reconnect()` which sets pipeline to NULL and registers a one-shot GLib timer. `try_reconnect_cb` polls `access(device, R_OK)` and calls `schedule_retry()` (which doubles backoff up to 60s) until the device returns.
+- **Camera disconnect**: `handle_error()` detects `GST_RESOURCE_ERROR` (recoverable) and calls `schedule_reconnect()`. Stream errors (`GST_STREAM_ERROR`, e.g. caps negotiation failures) are treated as fatal and quit the loop. On reconnect: the code waits for splitmuxsink to post EOS (finalizing the current segment) with a 3s fallback timeout, then tears down the pipeline and starts a `try_reconnect_cb` timer that polls `access(device, R_OK)` with exponential backoff (1s → 60s).
 - **Disk full**: `disk_poll_cb` (GLib timer) calls `DiskMonitor::is_disk_full()`. On full: sends EOS to flush the current segment cleanly, then pauses pipeline after EOS arrives. Resumes automatically when space frees up.
 
 ### Encrypted file format (`.vcpenc`)
