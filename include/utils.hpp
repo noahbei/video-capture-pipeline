@@ -32,11 +32,27 @@ inline std::string segment_filename(const Config& cfg,
     return cfg.output.directory + "/" + prefix + namebuf + ext;
 }
 
-// Returns the encrypted counterpart path: same as segment_filename + ".vcpenc"
+// Returns the encrypted counterpart path: always in output.directory, never in temp_dir.
 inline std::string encrypted_filename(const Config& cfg,
                                       const std::string& session_id,
                                       uint32_t index) {
     return segment_filename(cfg, session_id, index) + ".vcpenc";
+}
+
+// Returns the path where the muxer should write a segment.
+// When output.temp_dir is set the file lands there (typically a tmpfs mount);
+// otherwise falls back to segment_filename (output.directory).
+inline std::string staging_filename(const Config& cfg,
+                                    const std::string& session_id,
+                                    uint32_t index) {
+    if (cfg.output.temp_dir.empty())
+        return segment_filename(cfg, session_id, index);
+    const char* ext = (cfg.output.container == "mkv") ? ".mkv" : ".mp4";
+    char namebuf[256];
+    std::snprintf(namebuf, sizeof(namebuf),
+                  cfg.output.filename_pattern.c_str(), index);
+    const std::string prefix = session_id.empty() ? "" : session_id + "_";
+    return cfg.output.temp_dir + "/" + prefix + namebuf + ext;
 }
 
 } // namespace vcp::utils

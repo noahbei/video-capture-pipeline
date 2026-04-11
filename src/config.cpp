@@ -179,6 +179,7 @@ Config load_config(const std::string& path) {
         if (auto v = (*out)["directory"].value<std::string>())        cfg.output.directory        = *v;
         if (auto v = (*out)["container"].value<std::string>())        cfg.output.container        = *v;
         if (auto v = (*out)["filename_pattern"].value<std::string>()) cfg.output.filename_pattern = *v;
+        if (auto v = (*out)["temp_dir"].value<std::string>())         cfg.output.temp_dir         = *v;
     }
 
     // [rotation]
@@ -230,6 +231,11 @@ Config load_config(const std::string& path) {
     }
     if (cfg.encryption.enabled) {
         require_nonempty(cfg.encryption.key_file, "encryption.key_file");
+    }
+    if (!cfg.output.temp_dir.empty() && !cfg.encryption.enabled) {
+        throw std::runtime_error(
+            "config: output.temp_dir requires encryption.enabled = true "
+            "(temp staging without encryption leaves plaintext unreachable in the staging directory)");
     }
     if (cfg.camera.width <= 0 || cfg.camera.height <= 0) {
         throw std::runtime_error("config: camera width and height must be positive");

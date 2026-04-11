@@ -109,15 +109,16 @@ private:
     mutable std::mutex    segment_mutex_; // protects last_segment_ and last_segment_time_
 
     // ---- Async encryption worker ------------------------------------------
-    std::thread             enc_thread_;
-    std::queue<std::string> enc_queue_;  // paths of plaintext segments to encrypt
-    std::mutex              enc_mutex_;
+    struct EncJob { std::string src; std::string dst; };
+    std::thread          enc_thread_;
+    std::queue<EncJob>   enc_queue_;  // {plaintext src, encrypted dst} pairs
+    std::mutex           enc_mutex_;
     std::condition_variable enc_cv_;
-    std::atomic<bool>       enc_stop_{false};
-    std::atomic<uint32_t>   enc_queue_depth_{0};
+    std::atomic<bool>    enc_stop_{false};
+    std::atomic<uint32_t> enc_queue_depth_{0};
 
     void encryption_worker();
-    void enqueue_encryption(const std::string& plaintext_path);
+    void enqueue_encryption(const std::string& src, const std::string& dst);
 
     // ---- Internal helpers -------------------------------------------------
     bool build_pipeline();

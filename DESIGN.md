@@ -7,7 +7,7 @@
 - **Untrusted storage.** The recording volume is assumed to be physically accessible to an adversary. Encryption is on by default, and plaintext segments are deleted immediately after encryption.
 - **Key lives elsewhere.** The AES key is expected on a separate secure partition or HSM. Storing it alongside recordings is explicitly warned against.
 - **No frame loss is acceptable only up to a budget.** The design prioritises continuous recording over zero frame loss. When the encoder outpaces storage, the oldest buffered frames are dropped rather than blocking and stalling the entire pipeline.
-- **Encrypt-after-write is a deliberate simplicity tradeoff.** Segments are written to disk as plaintext first, then encrypted after each rotation completes. If the storage medium is considered untrusted even during the brief write phase, the correct approach would be to encrypt the data stream before it ever reaches the filesystem, such as by writing to a memory-backed staging area or piping through an in-process cipher. That approach was foregone here in favour of a simpler implementation.
+- **Encrypt-after-write is the default, with an opt-in staging mode for stricter deployments.** By default segments are written to disk as plaintext first, then encrypted after each rotation completes. When `output.temp_dir` is set (intended to point at a `tmpfs` mount), segments are written to RAM instead; the encrypted `.vcpenc` is written directly to `output.directory` and the staging file is always deleted afterward. Plaintext never reaches the persistent recording volume in this mode.
 - **The output directory stands in for a dedicated mount.** In a real deployment the recording directory would typically be a separate, dedicated filesystem mounted at a fixed path. For simplicity, a plain directory is used instead.
 ---
 
@@ -55,7 +55,9 @@ The muxer (`mp4mux` or `matroskamux`) is selected at runtime from the `[output] 
 
 Decryption verifies the auth tag via `EVP_DecryptFinal_ex`. If verification fails, the partial output file is deleted before the error is raised (`AuthenticationError`), preventing truncated or tampered data from being silently accepted.
 
-Encryption runs on a dedicated `std::thread` (`encryption_worker`) that drains a mutex-protected queue. This decouples encryption latency from the GStreamer pipeline and keeps the recording thread non-blocking. The final open segment (not closed by another `format-location-full` event) is manually enqueued by `run_loop()` after the GLib main loop exits.
+Encryption runs on a dedicated `std::thread` (`encryption_worker`) that drains a mutex-protected queue of `{src, dst}` path pairs. This decouples encryption latency from the GStreamer pipeline and keeps the recording thread non-blocking. The final open segment (not closed by another `format-location-full` event) is manually enqueued by `run_loop()` after the GLib main loop exits.
+
+When `output.temp_dir` is configured, `src` is the staging path (inside the tmpfs) and `dst` is the `.vcpenc` path inside `output.directory`. The staging file is always removed after encryption regardless of `delete_plaintext`. When `temp_dir` is not set, `dst` is `src + ".vcpenc"` in the same directory and `delete_plaintext` governs whether `src` is removed.
 
 ---
 
@@ -101,6 +103,7 @@ The `queue` element between the encoder and the muxer is configured with `leaky=
 | `splitmuxsink async-finalize=FALSE` | Moov atom is written synchronously before EOS is posted, so encryption never opens an incomplete file | Segment rotation blocks until the muxer finishes writing the trailer |
 | Per-segment IV (random) | No IV reuse even if the process crashes and restarts | 12 bytes of overhead per file (negligible) |
 | `delete_plaintext = true` by default | No plaintext copy remains on disk after encryption | If the process is killed mid-encryption, both files must be inspected on recovery |
+| tmpfs staging (`output.temp_dir`) | Plaintext never reaches persistent storage; staging vanishes on reboot if process crashes | Consumes RAM proportional to one open segment plus one being encrypted; requires a tmpfs mount sized accordingly |
 
 The dominant latency source in practice is the muxer flush at segment boundaries, not the encoder or encryption. Shorter `max_duration_sec` reduces the worst-case latency to access the latest recording but increases rotation overhead and the number of files to manage.
 

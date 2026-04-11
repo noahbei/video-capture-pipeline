@@ -319,6 +319,73 @@ static void test_key_file_size() {
 }
 
 // ---------------------------------------------------------------------------
+// Test: temp_dir without encryption.enabled throws
+// ---------------------------------------------------------------------------
+
+static void test_temp_dir_requires_encryption() {
+    std::printf("test_temp_dir_requires_encryption... ");
+
+    const std::string toml = R"toml(
+[camera]
+device = "/dev/video99"
+
+[output]
+directory = "/var/capture"
+temp_dir  = "/run/vcpcapture/staging"
+
+[rotation]
+mode             = "duration"
+max_duration_sec = 60
+
+[encryption]
+enabled  = false
+key_file = ""
+)toml";
+
+    const fs::path p = write_toml(toml);
+    bool threw = false;
+    try {
+        vcp::load_config(p.string());
+    } catch (const std::runtime_error& e) {
+        threw = true;
+        std::string msg = e.what();
+        assert(msg.find("temp_dir") != std::string::npos && "error should mention 'temp_dir'");
+    }
+    assert(threw && "temp_dir without encryption should throw");
+    std::printf("PASS\n");
+}
+
+// ---------------------------------------------------------------------------
+// Test: temp_dir with encryption parses correctly
+// ---------------------------------------------------------------------------
+
+static void test_temp_dir_parsed() {
+    std::printf("test_temp_dir_parsed... ");
+
+    const std::string toml = R"toml(
+[camera]
+device = "/dev/video99"
+
+[output]
+directory = "/var/capture"
+temp_dir  = "/run/vcpcapture/staging"
+
+[rotation]
+mode             = "duration"
+max_duration_sec = 60
+
+[encryption]
+enabled  = true
+key_file = "/tmp/test.key"
+)toml";
+
+    const fs::path p = write_toml(toml);
+    const vcp::Config cfg = vcp::load_config(p.string());
+    assert(cfg.output.temp_dir == "/run/vcpcapture/staging");
+    std::printf("PASS\n");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -331,6 +398,8 @@ int main() {
     test_encryption_no_key();
     test_unknown_keys_ignored();
     test_key_file_size();
+    test_temp_dir_requires_encryption();
+    test_temp_dir_parsed();
     std::printf("All tests PASSED\n");
     return 0;
 }

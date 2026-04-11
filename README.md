@@ -111,6 +111,43 @@ Logs are written to stderr as JSON lines (compatible with `journald`). Monitor t
 watch cat /run/vcpcapture/status.json
 ```
 
+## Keeping Plaintext Off Persistent Storage (tmpfs Staging)
+
+By default segments are written as plaintext files and encrypted after each rotation. If your threat model requires that plaintext never reach the recording volume at all, point `output.temp_dir` at a `tmpfs` mount. Segments are written to RAM, the encrypted `.vcpenc` goes directly to `output.directory`, and the staging file is always deleted.
+
+**1. Create and mount the tmpfs**
+
+Size it to hold two segments simultaneously (one being written, one being encrypted).
+
+```bash
+sudo mkdir -p /run/vcpcapture/staging
+sudo mount -t tmpfs -o size=256m tmpfs /run/vcpcapture/staging
+```
+
+To mount automatically on boot, add to `/etc/fstab`:
+```
+tmpfs /run/vcpcapture/staging tmpfs defaults,size=256m 0 0
+```
+
+General sizing formula:
+```
+(bitrate_kbps / 8) × max_duration_sec × 2 = bytes needed
+```
+
+**2. Set `temp_dir` in your config**
+
+```toml
+[output]
+directory = "/var/capture"
+temp_dir  = "/run/vcpcapture/staging"
+
+[encryption]
+enabled  = true          # required — temp_dir without encryption is rejected at startup
+key_file = "/etc/vcpcapture/enc.key"
+```
+
+`delete_plaintext` has no effect when `temp_dir` is set — the staging file is always removed.
+
 ## Example Config
 
 ```toml

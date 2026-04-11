@@ -70,7 +70,7 @@ All code lives in the `vcp` namespace. The build produces a static library `vcpc
 | `Encryptor` | `include/encryptor.hpp`, `src/encryptor.cpp` | Stateless `encrypt_file` / `decrypt_file` free functions (AES-256-GCM via OpenSSL EVP) |
 | `Health` | `include/health.hpp`, `src/health.cpp` | JSON-lines logging to stderr, atomic status file writes |
 | `DiskMonitor` | `include/disk_monitor.hpp`, `src/disk_monitor.cpp` | `statvfs`-based free-space check, no background thread |
-| `utils.hpp` | header-only | `utc_timestamp_str()`, `segment_filename()`, `encrypted_filename()` |
+| `utils.hpp` | header-only | `utc_timestamp_str()`, `segment_filename()`, `encrypted_filename()`, `staging_filename()` |
 
 ### GStreamer pipeline graph
 
@@ -91,7 +91,9 @@ v4l2src → capsfilter → jpegdec → videoconvert → videoscale → capsfilte
 
 ### Rotation and encryption flow
 
-`splitmuxsink` fires the `"format-location-full"` GObject signal just before opening fragment N. At that moment, fragment N-1 is fully closed and flushed. The static callback `Pipeline::on_format_location_full` enqueues the just-closed file path for encryption and returns the new filename. A dedicated `std::thread` (`encryption_worker`) drains this queue via mutex + condvar and calls `encryptor::encrypt_file`. The plaintext file is deleted after successful encryption if `encryption.delete_plaintext = true`.
+`splitmuxsink` fires the `"format-location-full"` GObject signal just before opening fragment N. At that moment, fragment N-1 is fully closed and flushed. The static callback `Pipeline::on_format_location_full` enqueues the just-closed file for encryption and returns the new filename. A dedicated `std::thread` (`encryption_worker`) drains a mutex + condvar queue of `{src, dst}` path pairs and calls `encryptor::encrypt_file`. The plaintext file is deleted after successful encryption if `encryption.delete_plaintext = true`.
+
+When `output.temp_dir` is set, `splitmuxsink` writes to that directory (intended to be a `tmpfs` mount) instead of `output.directory`. The `src` of each encryption job is the staging path; `dst` is always in `output.directory`. The staging file is always deleted after encryption regardless of `delete_plaintext`. `staging_filename()` in `utils.hpp` returns the correct write path — it delegates to `segment_filename()` when `temp_dir` is empty.
 
 The final segment (the one open when `stop()` is called) is never triggered by another `format-location-full` call, so `run_loop()` manually enqueues it after the GLib loop exits.
 

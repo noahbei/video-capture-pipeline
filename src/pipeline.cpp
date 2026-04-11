@@ -194,9 +194,10 @@ void Pipeline::run_loop() {
     if (cfg_.encryption.enabled) {
         const uint32_t last_idx = fragment_index_.load();
         if (last_idx > 0) {
-            const std::string path = utils::segment_filename(cfg_, session_id_, last_idx - 1);
+            const std::string path = utils::staging_filename(cfg_, session_id_, last_idx - 1);
             if (fs::exists(path)) {
-                enqueue_encryption(path);
+                const std::string dst = utils::encrypted_filename(cfg_, session_id_, last_idx - 1);
+                enqueue_encryption(path, dst);
             }
         }
     }
@@ -330,8 +331,12 @@ bool Pipeline::build_pipeline() {
     guint64 max_bytes = (cfg_.rotation.mode == "size")
                         ? cfg_.rotation.max_size_bytes : 0;
 
-    // Use a placeholder location; format-location-full signal overrides it
-    std::string location = cfg_.output.directory + "/seg_%05d." + cfg_.output.container;
+    // Use a placeholder location; format-location-full signal overrides it.
+    // Point at the staging dir when configured so splitmuxsink opens files there.
+    const std::string& write_dir = cfg_.output.temp_dir.empty()
+                                   ? cfg_.output.directory
+                                   : cfg_.output.temp_dir;
+    std::string location = write_dir + "/seg_%05d." + cfg_.output.container;
     // async-finalize=FALSE: splitmuxsink writes the moov atom synchronously
     // before posting EOS on the bus. This guarantees that when our bus watch
     // sees the EOS message, the file is fully written and safe to encrypt.
@@ -559,15 +564,16 @@ void Pipeline::do_reconnect_teardown(bool segment_finalized) {
     // Handle the segment that was open at disconnect time.
     const uint32_t partial_idx = fragment_index_.load();
     if (partial_idx > 0) {
-        const std::string partial_path = utils::segment_filename(cfg_, session_id_, partial_idx - 1);
+        const std::string partial_staging = utils::staging_filename(cfg_, session_id_, partial_idx - 1);
         std::error_code ec;
-        if (fs::exists(partial_path, ec)) {
+        if (fs::exists(partial_staging, ec)) {
             if (cfg_.encryption.enabled) {
-                enqueue_encryption(partial_path);
+                const std::string partial_enc = utils::encrypted_filename(cfg_, session_id_, partial_idx - 1);
+                enqueue_encryption(partial_staging, partial_enc);
             } else if (!segment_finalized) {
-                fs::remove(partial_path, ec);
-                if (ec) health_.warn("Failed to remove incomplete segment: " + partial_path + ": " + ec.message());
-                else    health_.info("Removed incomplete segment: " + partial_path);
+                fs::remove(partial_staging, ec);
+                if (ec) health_.warn("Failed to remove incomplete segment: " + partial_staging + ": " + ec.message());
+                else    health_.info("Removed incomplete segment: " + partial_staging);
             }
             // else: encryption disabled, file is a valid MP4 — keep it.
         }
@@ -699,23 +705,24 @@ gchar* Pipeline::on_format_location_full(GstElement* /*splitmux*/,
     // splitmuxsink instance; the partial segment from a prior disconnect (if any)
     // was already handled in schedule_reconnect().
     if (fragment_id > 0 && self->cfg_.encryption.enabled) {
-        const std::string prev_path = utils::segment_filename(self->cfg_, self->session_id_, actual_idx - 1);
-        if (fs::exists(prev_path)) {
-            self->enqueue_encryption(prev_path);
+        const std::string prev_staging = utils::staging_filename(self->cfg_, self->session_id_, actual_idx - 1);
+        if (fs::exists(prev_staging)) {
+            const std::string prev_enc = utils::encrypted_filename(self->cfg_, self->session_id_, actual_idx - 1);
+            self->enqueue_encryption(prev_staging, prev_enc);
         }
     }
 
     // Track segment stats
-    const std::string new_path = utils::segment_filename(self->cfg_, self->session_id_, actual_idx);
+    const std::string new_path = utils::staging_filename(self->cfg_, self->session_id_, actual_idx);
     {
         std::lock_guard<std::mutex> lk(self->segment_mutex_);
         if (fragment_id > 0) {
             self->segments_written_.fetch_add(1);
             // Approximate bytes: get file size of just-closed segment
             std::error_code ec;
-            const auto sz = fs::file_size(utils::segment_filename(self->cfg_, self->session_id_, actual_idx - 1), ec);
+            const auto sz = fs::file_size(utils::staging_filename(self->cfg_, self->session_id_, actual_idx - 1), ec);
             if (!ec) self->bytes_written_.fetch_add(sz);
-            self->last_segment_      = utils::segment_filename(self->cfg_, self->session_id_, actual_idx - 1);
+            self->last_segment_      = utils::staging_filename(self->cfg_, self->session_id_, actual_idx - 1);
             self->last_segment_time_ = utils::utc_timestamp_str();
         }
     }
@@ -731,10 +738,10 @@ gchar* Pipeline::on_format_location_full(GstElement* /*splitmux*/,
 // Encryption worker
 // ---------------------------------------------------------------------------
 
-void Pipeline::enqueue_encryption(const std::string& plaintext_path) {
+void Pipeline::enqueue_encryption(const std::string& src, const std::string& dst) {
     {
         std::lock_guard<std::mutex> lk(enc_mutex_);
-        enc_queue_.push(plaintext_path);
+        enc_queue_.push({src, dst});
         enc_queue_depth_.store(static_cast<uint32_t>(enc_queue_.size()));
     }
     enc_cv_.notify_one();
@@ -742,7 +749,7 @@ void Pipeline::enqueue_encryption(const std::string& plaintext_path) {
 
 void Pipeline::encryption_worker() {
     while (true) {
-        std::string job;
+        EncJob job;
         {
             std::unique_lock<std::mutex> lk(enc_mutex_);
             enc_cv_.wait(lk, [this] { return !enc_queue_.empty() || enc_stop_.load(); });
@@ -752,18 +759,21 @@ void Pipeline::encryption_worker() {
             enc_queue_depth_.store(static_cast<uint32_t>(enc_queue_.size()));
         }
 
-        const fs::path src(job);
-        const fs::path dst = fs::path(job).concat(".vcpenc");
+        const fs::path src(job.src);
+        const fs::path dst(job.dst);
         try {
             encrypt_file(src, dst, std::span<const uint8_t, 32>(key_.data(), 32));
-            if (cfg_.encryption.delete_plaintext) {
+            // Always remove the source after encryption:
+            //   - temp_dir mode: source is in staging (tmpfs), must be freed
+            //   - normal mode:   respect delete_plaintext config
+            if (!cfg_.output.temp_dir.empty() || cfg_.encryption.delete_plaintext) {
                 std::error_code ec;
                 fs::remove(src, ec);
-                if (ec) health_.warn("Failed to remove plaintext: " + job + ": " + ec.message());
+                if (ec) health_.warn("Failed to remove plaintext: " + job.src + ": " + ec.message());
             }
             health_.info("Encrypted: " + dst.string());
         } catch (const std::exception& e) {
-            health_.error(std::string("Encryption failed for ") + job + ": " + e.what());
+            health_.error(std::string("Encryption failed for ") + job.src + ": " + e.what());
         }
     }
 }

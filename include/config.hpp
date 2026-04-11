@@ -27,6 +27,9 @@ struct OutputConfig {
     std::string directory        = "/var/capture";
     std::string container        = "mp4";     // "mp4" or "mkv"
     std::string filename_pattern = "seg_%05d"; // printf index; extension appended
+    // If non-empty, segments are written here first (intended for a tmpfs mount)
+    // then the encrypted .vcpenc is written to `directory`. Requires encryption.enabled.
+    std::string temp_dir;
 };
 
 struct RotationConfig {

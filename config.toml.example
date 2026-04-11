@@ -44,6 +44,12 @@ container       = "mp4"
 # Example: "seg_%05d" → 20260412T142205_seg_00000.mp4, 20260412T142205_seg_00001.mp4, ...
 filename_pattern = "seg_%05d"
 
+# Optional: staging directory for in-flight segment files (plaintext never reaches `directory`).
+# Point this at a tmpfs mount so segments are written entirely in RAM, then the encrypted
+# .vcpenc is moved to `directory`. The staging file is always deleted after encryption.
+# Requires encryption.enabled = true.
+# Setup: mount -t tmpfs -o size=512m tmpfs /run/vcpcapture/staging
+# temp_dir        = "/run/vcpcapture/staging"
 
 [rotation]
 # Rotation trigger: "duration" (time-based) or "size" (file-size-based)
