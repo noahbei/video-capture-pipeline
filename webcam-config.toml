@@ -1,0 +1,98 @@
+# vcpcapture configuration — copy to config.toml and adjust for your deployment
+# Usage: vcpcapture --config /path/to/config.toml
+
+[camera]
+# V4L2 device node
+device          = "/dev/video2"
+
+# Capture resolution (pixels)
+width           = 1280
+height          = 720
+
+# Frames per second
+framerate       = 10
+
+# V4L2 pixel format: YUY2 (common USB), MJPG (USB compressed), NV12 (CSI/SoC)
+pixel_format    = "YUY2"
+
+
+[encoder]
+# H.264 average bitrate in kbps
+bitrate_kbps    = 2000
+
+# x264 speed preset: ultrafast superfast veryfast faster fast medium slow slower veryslow placebo
+# Use "ultrafast" for embedded; "medium" for better compression at the cost of CPU
+speed_preset    = "ultrafast"
+
+# x264 tune flags (string passed directly to x264enc)
+tune            = "zerolatency"
+
+# Maximum distance between I-frames (keyframes). Keep equal to framerate for clean per-segment seeking.
+key_int_max     = 10
+
+
+[output]
+# Directory where segments are written. Created if it does not exist.
+directory       = "/var/capture"
+
+# Container format: "mp4" or "mkv"
+container       = "mp4"
+
+# printf-style pattern for segment filenames (%d = segment index). Extension is appended.
+# Example: "seg_%05d" → seg_00000.mp4, seg_00001.mp4, ...
+filename_pattern = "seg_%05d"
+
+
+[rotation]
+# Rotation trigger: "duration" (time-based) or "size" (file-size-based)
+mode            = "size"
+
+# Maximum segment size in bytes (active when mode = "size")
+# Example: 524288000 = 500 MB
+max_size_bytes  = 4000000
+
+# Maximum segment duration in seconds (active when mode = "duration")
+max_duration_sec = 30
+
+
+[encryption]
+# Set to false to disable encryption entirely (plaintext files stored on disk)
+enabled         = true
+
+# Path to a 32-byte (256-bit) raw binary AES key file.
+# Generate with: ./scripts/gen_key.sh /path/to/enc.key
+# IMPORTANT: store the key file on a separate, secure partition or device.
+#            Storing the key alongside the recordings weakens security.
+key_file        = "/etc/vcpcapture/enc.key"
+
+# Delete the plaintext segment after successful encryption.
+# Set to false only for debugging — plaintext on disk negates encryption protection.
+delete_plaintext = true
+
+
+[backpressure]
+# Maximum number of encoded frames buffered between encoder and muxer.
+# When full, the oldest frames are dropped (leaky downstream queue).
+# Increase for slower storage; decrease to limit memory use.
+queue_max_buffers = 200
+
+
+[disk]
+# Minimum free space in bytes. Recording pauses when free space drops below this threshold.
+# Recording resumes automatically when space becomes available.
+# Example: 524288000 = 500 MB
+min_free_bytes  = 524288000
+
+# How often to check disk space (seconds)
+poll_interval_sec = 5
+
+
+[health]
+# Log verbosity level: debug | info | warn | error
+# Logs are written to stderr in JSON-lines format (compatible with journald).
+log_level       = "info"
+
+# Path to the JSON status file. Written atomically on every state change.
+# Read with: watch cat /run/vcpcapture/status.json
+# Set to "" to disable.
+status_file     = "/run/vcpcapture/status.json"
