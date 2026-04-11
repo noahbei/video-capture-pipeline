@@ -125,22 +125,27 @@ void Pipeline::run_loop() {
     g_main_loop_run(loop_); // blocks
 
     // After the loop exits, finalize
+
+    // NULL the pipeline (flushes and closes any open file) before touching the
+    // segment on disk. el_.pipeline may already be null if we stopped while in
+    // the Reconnecting state (pipeline was torn down but not yet rebuilt).
     if (el_.pipeline) {
-        // Encrypt the last open segment
+        gst_element_set_state(el_.pipeline, GST_STATE_NULL);
+    }
+
+    // Encrypt the last open segment. fragment_index_ always reflects the
+    // absolute index of the next-to-be-opened segment, so the currently-open
+    // (or last-open) segment is at fragment_index_ - 1. Do this regardless of
+    // whether el_.pipeline is set so a partial segment from a mid-reconnect
+    // shutdown is still encrypted.
+    if (cfg_.encryption.enabled) {
         const uint32_t last_idx = fragment_index_.load();
-        if (last_idx > 0 && cfg_.encryption.enabled) {
-            // fragment_index_ was already incremented when the last segment opened;
-            // the last CLOSED segment is (last_idx - 1) if a rotation happened,
-            // but if we're stopping mid-segment, the current segment is last_idx - 1
-            // (it was opened but never caused another format-location-full call).
-            const uint32_t current_open = (fragment_index_.load() > 0)
-                                          ? fragment_index_.load() - 1 : 0;
-            const std::string path = utils::segment_filename(cfg_, current_open);
+        if (last_idx > 0) {
+            const std::string path = utils::segment_filename(cfg_, last_idx - 1);
             if (fs::exists(path)) {
                 enqueue_encryption(path);
             }
         }
-        gst_element_set_state(el_.pipeline, GST_STATE_NULL);
     }
 
     // Drain encryption queue
@@ -167,7 +172,10 @@ void Pipeline::request_quit() {
 // ---------------------------------------------------------------------------
 
 bool Pipeline::build_pipeline() {
-    loop_ = g_main_loop_new(nullptr, FALSE);
+    // On reconnect the GLib main loop is already running; reuse it.
+    if (!loop_) {
+        loop_ = g_main_loop_new(nullptr, FALSE);
+    }
 
     // Create all elements
     el_.pipeline = gst_pipeline_new("vcpcapture");
@@ -268,7 +276,6 @@ bool Pipeline::build_pipeline() {
                  "muxer-factory",   muxer_factory,
                  "max-size-time",   max_time,
                  "max-size-bytes",  max_bytes,
-                 "async-finalize",  TRUE,
                  nullptr);
 
     // Add all elements to the pipeline bin
@@ -306,7 +313,7 @@ bool Pipeline::build_pipeline() {
 
     // Install bus watch on the default GLib main context
     GstBus* bus = gst_element_get_bus(el_.pipeline);
-    gst_bus_add_watch(bus, [](GstBus*, GstMessage* msg, gpointer udata) -> gboolean {
+    bus_watch_id_ = gst_bus_add_watch(bus, [](GstBus*, GstMessage* msg, gpointer udata) -> gboolean {
         auto* self = static_cast<Pipeline*>(udata);
         switch (GST_MESSAGE_TYPE(msg)) {
             case GST_MESSAGE_ERROR:
@@ -339,6 +346,10 @@ void Pipeline::destroy_pipeline() {
     if (disk_timer_src_) {
         g_source_remove(disk_timer_src_);
         disk_timer_src_ = 0;
+    }
+    if (bus_watch_id_) {
+        g_source_remove(bus_watch_id_);
+        bus_watch_id_ = 0;
     }
     if (el_.pipeline) {
         gst_element_set_state(el_.pipeline, GST_STATE_NULL);
@@ -422,7 +433,20 @@ void Pipeline::handle_eos() {
 
 void Pipeline::schedule_reconnect() {
     set_state(PipelineState::Reconnecting);
-    gst_element_set_state(el_.pipeline, GST_STATE_NULL);
+
+    // Tear down the broken pipeline elements. Remove the bus watch first so
+    // any pending messages from the dying pipeline don't fire callbacks while
+    // we're in the middle of destruction.
+    if (bus_watch_id_) {
+        g_source_remove(bus_watch_id_);
+        bus_watch_id_ = 0;
+    }
+    if (el_.pipeline) {
+        gst_element_set_state(el_.pipeline, GST_STATE_NULL);
+        gst_object_unref(el_.pipeline);
+        el_ = {};
+    }
+
     reconnect_attempts_.fetch_add(1);
     health_.info("Scheduling reconnect in " + std::to_string(reconnect_backoff_sec_) + "s");
     health_.write_status(make_status());
@@ -444,9 +468,32 @@ gboolean Pipeline::try_reconnect_cb(gpointer user_data) {
     }
 
     self->health_.info("Device available, reconnecting pipeline");
+
+    // Build a fresh pipeline. Set fragment_index_start_ so the new splitmuxsink
+    // (whose internal fragment_id resets to 0) continues numbering from where
+    // we left off instead of overwriting existing segment files.
+    self->fragment_index_start_ = self->fragment_index_.load();
+
+    if (!self->build_pipeline()) {
+        self->health_.error("Reconnect failed (build_pipeline failed), retrying");
+        // build_pipeline may have partially constructed elements; clean up
+        if (self->bus_watch_id_) { g_source_remove(self->bus_watch_id_); self->bus_watch_id_ = 0; }
+        if (self->el_.pipeline) {
+            gst_element_set_state(self->el_.pipeline, GST_STATE_NULL);
+            gst_object_unref(self->el_.pipeline);
+            self->el_ = {};
+        }
+        self->schedule_retry();
+        return FALSE;
+    }
+
     GstStateChangeReturn ret = gst_element_set_state(self->el_.pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
         self->health_.error("Reconnect failed (set PLAYING returned FAILURE), retrying");
+        if (self->bus_watch_id_) { g_source_remove(self->bus_watch_id_); self->bus_watch_id_ = 0; }
+        gst_element_set_state(self->el_.pipeline, GST_STATE_NULL);
+        gst_object_unref(self->el_.pipeline);
+        self->el_ = {};
         self->schedule_retry();
     } else {
         self->reconnect_backoff_sec_ = 1; // reset backoff on success
@@ -508,30 +555,37 @@ gchar* Pipeline::on_format_location_full(GstElement* /*splitmux*/,
                                           gpointer user_data) {
     auto* self = static_cast<Pipeline*>(user_data);
 
-    // Encrypt the previous (now-closed) segment
+    // splitmuxsink's internal fragment_id resets to 0 on each pipeline rebuild.
+    // Offset it so segment filenames continue from where they left off.
+    const uint32_t actual_idx = self->fragment_index_start_ + fragment_id;
+
+    // Encrypt the previous (now-closed) segment. Use fragment_id (not actual_idx)
+    // for the > 0 guard: when fragment_id==0 there is no prior segment from this
+    // splitmuxsink instance; the partial segment from a prior disconnect (if any)
+    // is handled separately in run_loop().
     if (fragment_id > 0 && self->cfg_.encryption.enabled) {
-        const std::string prev_path = utils::segment_filename(self->cfg_, fragment_id - 1);
+        const std::string prev_path = utils::segment_filename(self->cfg_, actual_idx - 1);
         if (fs::exists(prev_path)) {
             self->enqueue_encryption(prev_path);
         }
     }
 
     // Track segment stats
-    const std::string new_path = utils::segment_filename(self->cfg_, fragment_id);
+    const std::string new_path = utils::segment_filename(self->cfg_, actual_idx);
     {
         std::lock_guard<std::mutex> lk(self->segment_mutex_);
         if (fragment_id > 0) {
             self->segments_written_.fetch_add(1);
             // Approximate bytes: get file size of just-closed segment
             std::error_code ec;
-            const auto sz = fs::file_size(utils::segment_filename(self->cfg_, fragment_id - 1), ec);
+            const auto sz = fs::file_size(utils::segment_filename(self->cfg_, actual_idx - 1), ec);
             if (!ec) self->bytes_written_.fetch_add(sz);
-            self->last_segment_      = utils::segment_filename(self->cfg_, fragment_id - 1);
+            self->last_segment_      = utils::segment_filename(self->cfg_, actual_idx - 1);
             self->last_segment_time_ = utils::utc_timestamp_str();
         }
     }
 
-    self->fragment_index_.store(fragment_id + 1);
+    self->fragment_index_.store(actual_idx + 1);
     self->health_.debug("Opening segment " + new_path);
     self->health_.write_status(self->make_status());
 

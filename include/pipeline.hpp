@@ -77,6 +77,7 @@ private:
 
     GMainLoop* loop_ = nullptr;
     guint      disk_timer_src_ = 0;
+    guint      bus_watch_id_   = 0;
 
     // ---- Configuration + dependencies -------------------------------------
     const Config&   cfg_;
@@ -91,7 +92,8 @@ private:
     std::time_t                start_time_            = 0;
 
     // ---- Segment tracking -------------------------------------------------
-    std::atomic<uint32_t> fragment_index_{0}; // next fragment index to open
+    std::atomic<uint32_t> fragment_index_{0};       // absolute index of the next segment to open
+    uint32_t              fragment_index_start_ = 0; // offset added on each pipeline rebuild
     std::atomic<uint64_t> segments_written_{0};
     std::atomic<uint64_t> bytes_written_{0};
     std::string           last_segment_;
