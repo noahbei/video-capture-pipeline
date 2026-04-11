@@ -93,6 +93,17 @@ void Pipeline::start() {
 
     GstStateChangeReturn ret = gst_element_set_state(el_.pipeline, GST_STATE_PLAYING);
     if (ret == GST_STATE_CHANGE_FAILURE) {
+        // If this is a v4l2src pipeline and the device node is not accessible,
+        // treat startup failure the same as a mid-session disconnect: tear down
+        // and enter the reconnect loop so the daemon waits for the camera rather
+        // than exiting.
+        const bool is_v4l2 = cfg_.camera.src_element.empty() ||
+                             cfg_.camera.src_element == "v4l2src";
+        if (is_v4l2 && access(cfg_.camera.device.c_str(), R_OK) != 0) {
+            health_.info("Camera device not available at startup, entering reconnect loop");
+            schedule_reconnect();
+            return;
+        }
         throw std::runtime_error("Pipeline::start: failed to set pipeline to PLAYING");
     }
 
@@ -442,8 +453,10 @@ void Pipeline::handle_error(GstMessage* msg) {
                               + (dbg ? std::string(" [") + dbg + "]" : "");
     health_.error("GStreamer error: " + err_msg);
 
-    bool is_recoverable = err && (err->domain == GST_RESOURCE_ERROR ||
-                                    err->domain == GST_STREAM_ERROR);
+    // Only resource errors (device gone, can't open, read failure) are recoverable
+    // via reconnect. Stream errors (caps negotiation, unsupported format/framerate)
+    // are configuration mistakes that retrying will never fix — treat them as fatal.
+    bool is_recoverable = err && (err->domain == GST_RESOURCE_ERROR);
     g_clear_error(&err);
     g_free(dbg);
 
@@ -451,7 +464,7 @@ void Pipeline::handle_error(GstMessage* msg) {
         // Camera disconnect or read failure — attempt reconnect
         schedule_reconnect();
     } else {
-        // Non-recoverable error; quit the main loop
+        // Non-recoverable error (format/caps mismatch, or error outside Recording state); quit
         if (loop_) g_main_loop_quit(loop_);
     }
 }

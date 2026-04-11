@@ -7,8 +7,10 @@ A GStreamer-based video capture daemon that records from V4L2 cameras into rotat
 Install dependencies:
 
 ```bash
-sudo apt install libssl-dev libtomlplusplus-dev \
+sudo apt install cmake build-essential pkg-config \
+  libssl-dev libtomlplusplus-dev \
   libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
   gstreamer1.0-plugins-ugly
 ```
 
@@ -24,11 +26,66 @@ Outputs:
 - `build/vcpdecrypt` — standalone decrypt tool
 - `build/tests/test_*` — test binaries
 
+## Finding Your Camera's Device Info
+
+Before editing `config.toml`, use `v4l2-ctl` (from the `v4l-utils` package) to find the correct values for your camera.
+
+**Install v4l-utils if needed:**
+
+```bash
+sudo apt install v4l-utils
+```
+
+**List all connected video devices:**
+
+```bash
+v4l2-ctl --list-devices
+```
+
+Example output:
+```
+USB Camera: USB2.0 camera (usb-0000:01:00.3-4):
+    /dev/video0
+    /dev/video1
+```
+
+Use the first `/dev/videoN` path as the `device` value in `[camera]`.
+
+**List supported formats, resolutions, and framerates for a device:**
+
+```bash
+v4l2-ctl --device=/dev/video0 --list-formats-ext
+```
+
+Example output:
+```
+[0]: 'MJPG' (Motion-JPEG, compressed)
+    Size: Discrete 1280x720
+        Interval: Discrete 0.033s (30.000 fps)
+[1]: 'YUYV' (YUYV 4:2:2)
+    Size: Discrete 1280x720
+        Interval: Discrete 0.100s (10.000 fps)
+    Size: Discrete 640x480
+        Interval: Discrete 0.033s (30.000 fps)
+```
+
+Map these values to your `config.toml`:
+
+| v4l2-ctl output | config.toml field | Example value |
+|---|---|---|
+| Device path | `[camera] device` | `/dev/video0` |
+| Format code | `[camera] pixel_format` | `YUYV` or `MJPG` |
+| Size | `[camera] width` / `height` | `1280` / `720` |
+| Interval → fps | `[camera] framerate` | `30` |
+
+> **Note:** `pixel_format` accepts both `YUYV` and `YUY2` as equivalent values.
+
 ## Running
 
 **1. Generate an encryption key**
 
 ```bash
+chmod +x ./scripts/gen_key.sh
 ./scripts/gen_key.sh enc.key
 ```
 
